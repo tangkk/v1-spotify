@@ -29,6 +29,7 @@ Routes:
   GET  /spotify-api/artists/<id>/albums
   GET  /spotify-api/artists/<id>/dedup-tracks
   GET  /spotify-api/albums/<id>
+  GET  /spotify-api/albums/<id>/next-in-artist -> {"next": {id, name, image}|null} -- same-artist auto-continue lookup
   GET  /spotify-api/devices
   GET  /spotify-api/recently-played
   GET  /spotify-api/player/queue       -> {"currently_playing": {...}|null, "queue": [...]}
@@ -86,6 +87,7 @@ SEARCH_CACHE_TTL = 60
 ARTIST_ALBUMS_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/albums$")
 ARTIST_DEDUP_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/dedup-tracks$")
 ALBUM_RE = re.compile(r"^/spotify-api/albums/([A-Za-z0-9]{10,40})$")
+NEXT_IN_ARTIST_RE = re.compile(r"^/spotify-api/albums/([A-Za-z0-9]{10,40})/next-in-artist$")
 FAVORITE_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})$")
 FAVORITE_GENRES_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})/genres$")
 ALBUM_TYPE_RANK = {"album": 3, "single": 2, "compilation": 1, "appears_on": 0}
@@ -173,7 +175,32 @@ def db():
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass
+    conn.execute("""CREATE TABLE IF NOT EXISTS catalog_cache (
+        cache_key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        cached_at INTEGER NOT NULL
+    )""")
     return conn
+
+
+# Permanent (no expiration) cache for the artist/album/track catalog data
+# this app reads from Spotify's Web API. Artist discographies and album
+# tracklists essentially never change, and the alternative is repeatedly
+# re-paying this app's tight per-endpoint daily quota (see README) for data
+# that was already fetched once. Every catalog read in this file checks here
+# before calling Spotify at all.
+def cache_get(key):
+    with db() as conn:
+        row = conn.execute("SELECT payload FROM catalog_cache WHERE cache_key=?", (key,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def cache_set(key, value):
+    with db() as conn:
+        conn.execute("""INSERT INTO catalog_cache(cache_key, payload, cached_at) VALUES (?, ?, ?)
+                         ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, cached_at=excluded.cached_at""",
+                     (key, json.dumps(value), int(time.time())))
+        conn.commit()
 
 
 def save_account(refresh_token, display_name, product):
@@ -372,6 +399,10 @@ def cached_search(kind, query, limit, offset=0):
 
 
 def fetch_artist_albums(artist_id, groups, limit_total=200):
+    cache_key = f"artist_albums:{artist_id}:{groups}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached[:limit_total]
     albums = []
     seen = set()
     offset = 0
@@ -390,7 +421,52 @@ def fetch_artist_albums(artist_id, groups, limit_total=200):
         if not page.get("next"):
             break
         offset += SPOTIFY_PAGE_LIMIT
-    return albums[:limit_total]
+    result = albums[:limit_total]
+    cache_set(cache_key, result)
+    return result
+
+
+def fetch_album_meta(album_id):
+    cache_key = f"album_meta:{album_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+    album = spotify_api("GET", f"/albums/{album_id}")
+    cache_set(cache_key, album)
+    return album
+
+
+def find_next_album_for_artist(artist_id, album_type, after_album_id):
+    """Bounded (a single Spotify request, not fetch_artist_albums's full
+    pagination) lookup used only by the lazy same-artist auto-continue
+    trigger, so one automatic background event costs at most one request
+    against the quota-limited artists/albums endpoint. Cached permanently
+    under its own key either way, separate from fetch_artist_albums's cache
+    (which covers the "album,single,compilation" combined groups a deliberate
+    artist-page visit fetches, not the single group this needs)."""
+    cache_key = f"artist_albums_page1:{artist_id}:{album_type}"
+    albums = cache_get(cache_key)
+    if albums is None:
+        page = spotify_api("GET", f"/artists/{artist_id}/albums",
+                            params={"include_groups": album_type, "limit": SPOTIFY_PAGE_LIMIT, "offset": 0})
+        items = page.get("items", [])
+        seen = set()
+        albums = []
+        for a in items:
+            key = (normalize_title(a.get("name", "")), a.get("release_date", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            albums.append(a)
+        cache_set(cache_key, albums)
+    ordered = sorted(albums, key=lambda a: a.get("release_date") or "", reverse=True)
+    ids = [a["id"] for a in ordered]
+    if after_album_id not in ids:
+        return None
+    pos = ids.index(after_album_id)
+    if pos + 1 >= len(ids):
+        return None
+    return ordered[pos + 1]
 
 
 def track_summary(t):
@@ -409,6 +485,10 @@ def track_summary(t):
 
 
 def fetch_album_tracks(album_id, limit_total=300):
+    cache_key = f"album_tracks:{album_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached[:limit_total]
     tracks = []
     offset = 0
     while len(tracks) < limit_total:
@@ -421,7 +501,9 @@ def fetch_album_tracks(album_id, limit_total=300):
         if not page.get("next"):
             break
         offset += SPOTIFY_PAGE_LIMIT
-    return tracks[:limit_total]
+    result = tracks[:limit_total]
+    cache_set(cache_key, result)
+    return result
 
 
 # ---------------------------------------------------------- dedup helpers --
@@ -1432,14 +1514,33 @@ async function renderAlbumView(album) {
 // Album finished with nothing next queued by Spotify itself -- if it was
 // played from an artist's album list, auto-advance to the next album in that
 // same list, replacing the current view without adding Back history.
-async function advanceAlbumQueue() {
+async function advanceAlbumQueue(finishedAlbumId) {
   const queue = state.albumQueue;
-  if (!queue) return;
-  const nextPos = queue.pos + 1;
-  if (nextPos >= queue.ids.length) { state.albumQueue = null; return; }
-  const nextId = queue.ids[nextPos];
-  await replaceCurrent({type: 'album', id: nextId, queueCtx: {ids: queue.ids, pos: nextPos}});
-  await playUris(null, 'spotify:album:' + nextId);
+  if (queue) {
+    const nextPos = queue.pos + 1;
+    if (nextPos < queue.ids.length) {
+      const nextId = queue.ids[nextPos];
+      await replaceCurrent({type: 'album', id: nextId, queueCtx: {ids: queue.ids, pos: nextPos}});
+      await playUris(null, 'spotify:album:' + nextId);
+      return;
+    }
+    state.albumQueue = null;
+    // Curated group exhausted -- fall through to the same-artist lookup below
+    // instead of just stopping.
+  }
+  // No known queue context at all (album reached via search/recently-played/
+  // queue rather than browsing the artist), or the curated group just ran
+  // out: look up "the next album by this artist" on demand, once, right now
+  // that it's actually needed -- server-side this is cached permanently and
+  // bounded to a single Spotify request on a cold cache.
+  if (!finishedAlbumId) return;
+  try {
+    const result = await api('/spotify-api/albums/' + finishedAlbumId + '/next-in-artist');
+    if (result.next) {
+      await replaceCurrent({type: 'album', id: result.next.id});
+      await playUris(null, 'spotify:album:' + result.next.id);
+    }
+  } catch (e) {}
 }
 
 // ---- now playing / transport ----
@@ -1531,7 +1632,7 @@ async function pollNowPlaying() {
     const justStopped = wasPlayingTick && !np.playing;
     wasPlayingTick = np.playing;
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
-    if (justStopped && nearEnd) await advanceAlbumQueue();
+    if (justStopped && nearEnd) await advanceAlbumQueue(np.track.album_id);
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
@@ -1725,6 +1826,9 @@ class Handler(BaseHTTPRequestHandler):
         match = ARTIST_DEDUP_RE.match(path)
         if match:
             self.handle_dedup(match.group(1), query); return
+        match = NEXT_IN_ARTIST_RE.match(path)
+        if match:
+            self.handle_next_in_artist(match.group(1)); return
         match = ALBUM_RE.match(path)
         if match:
             self.handle_album(match.group(1)); return
@@ -1860,7 +1964,7 @@ class Handler(BaseHTTPRequestHandler):
         if cached:
             self.send_json(200, cached)
             return
-        album = spotify_api("GET", f"/albums/{album_id}")
+        album = fetch_album_meta(album_id)
         tracks = fetch_album_tracks(album_id)
         images = album.get("images") or []
         result = {
@@ -1879,6 +1983,18 @@ class Handler(BaseHTTPRequestHandler):
             add_favorite(album_id, result["name"], result["artists"], result["image"],
                          result["album_type"], result["release_date"], result["tracks"])
         self.send_json(200, result)
+
+    def handle_next_in_artist(self, album_id):
+        album = fetch_album_meta(album_id)
+        artists = album.get("artists") or []
+        if not artists:
+            self.send_json(200, {"next": None}); return
+        nxt = find_next_album_for_artist(artists[0]["id"], album.get("album_type", "album"), album_id)
+        if not nxt:
+            self.send_json(200, {"next": None}); return
+        images = nxt.get("images") or []
+        self.send_json(200, {"next": {"id": nxt["id"], "name": nxt["name"],
+                                       "image": images[0]["url"] if images else None}})
 
     def handle_devices(self):
         result = spotify_api("GET", "/me/player/devices")
