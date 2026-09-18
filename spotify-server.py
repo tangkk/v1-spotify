@@ -606,6 +606,8 @@ function renderLinkPanel(status) {
 }
 
 let sdkConnectTriggered = false;
+let sdkPlayerReady = false;
+let sdkPlayerWaiters = [];
 let deviceReadyWaiters = [];
 
 function initSDK() {
@@ -616,6 +618,9 @@ function initSDK() {
       volume: 0.7,
     });
     state.player = player;
+    sdkPlayerReady = true;
+    sdkPlayerWaiters.forEach(fn => fn());
+    sdkPlayerWaiters = [];
     player.addListener('ready', ({device_id}) => {
       state.deviceId = device_id;
       deviceReadyWaiters.forEach(fn => fn(device_id));
@@ -628,12 +633,25 @@ function initSDK() {
   };
 }
 
+function waitForPlayerObject(timeoutMs) {
+  if (sdkPlayerReady) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    sdkPlayerWaiters.push(() => { clearTimeout(timer); resolve(true); });
+  });
+}
+
 // iOS/Safari requires connect() (and, where supported, activateElement()) to
 // happen inside a real synchronous click handler or there is no audio at all --
 // calling this is not a separate "Enable Playback" step for the user, it just
 // has to be the very first statement of whichever click actually starts
-// playback, so the browser still counts it as the same user gesture.
-function ensureAudioUnlocked() {
+// playback, so the browser still counts it as the same user gesture. If the
+// sdk.scdn.co script itself hasn't finished loading yet (very first click,
+// slow network), wait briefly for the Player object to exist -- best effort,
+// since that wait technically happens outside the original gesture.
+async function ensureAudioUnlocked() {
+  if (sdkConnectTriggered) return;
+  if (!sdkPlayerReady) await waitForPlayerObject(5000);
   if (!state.player || sdkConnectTriggered) return;
   sdkConnectTriggered = true;
   if (typeof state.player.activateElement === 'function') {
@@ -659,13 +677,16 @@ async function refreshDevices() {
 
 // This browser's own SDK device is always the preferred playback target --
 // that's the whole point of "whichever device you clicked Play on is the one
-// that should make sound" -- so if we just triggered connect(), wait a few
-// seconds for this device to actually come online before falling back to
-// whatever other Spotify Connect device happens to be active.
+// that should make sound" -- so if we just triggered connect(), wait for this
+// device to actually come online before falling back to whatever other
+// Spotify Connect device happens to be active. The very first connect() on a
+// device involves a fresh WebSocket handshake, auth, and (on some browsers) an
+// EME session negotiation, which can legitimately take several seconds -- this
+// is a one-time cold-start cost, not a retry loop, so it's worth a long wait.
 async function ensureDevice() {
   if (state.deviceId) return state.deviceId;
   if (sdkConnectTriggered) {
-    const id = await waitForDeviceReady(4000);
+    const id = await waitForDeviceReady(12000);
     if (id) return id;
   }
   await refreshDevices();
@@ -675,7 +696,7 @@ async function ensureDevice() {
 }
 
 async function playUris(uris, contextUri, offset) {
-  ensureAudioUnlocked();
+  await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   const body = {device_id};
@@ -867,7 +888,11 @@ async function openDedup(artist, push) {
     playAll.onclick = () => playUris(items.slice(0, 50).map(t => t.uri));
     view.appendChild(playAll);
     const list = el('ul', 'list');
-    for (const t of items) {
+    items.forEach((t, i) => {
+      // Clicking a track queues it plus the rest of this (already-capped)
+      // deduplicated list, so playback continues track-to-track instead of
+      // stopping after the one song -- same continuation behavior as "Play all".
+      const queueFrom = idx => items.slice(idx, idx + 50).map(x => x.uri);
       const li = el('li');
       li.appendChild(coverImg(t.image));
       const meta = el('div', 'meta');
@@ -875,21 +900,21 @@ async function openDedup(artist, push) {
       const sub = el('div', 'sub', t.album_name + ' · ' + (t.release_date || '').slice(0, 4) + ' · ' + fmtDuration(t.duration_ms));
       if (t.variant_count > 1) sub.appendChild(el('span', 'badge', t.variant_count + ' versions'));
       meta.appendChild(sub);
-      meta.onclick = () => playUris([t.uri]);
+      meta.onclick = () => playUris(queueFrom(i));
       li.appendChild(meta);
-      const playBtn = el('button', 'button small', '▶'); playBtn.onclick = () => playUris([t.uri]);
+      const playBtn = el('button', 'button small', '▶'); playBtn.onclick = () => playUris(queueFrom(i));
       li.appendChild(playBtn);
       list.appendChild(li);
       if (t.variant_count > 1) {
         const variants = el('div', 'variants');
         for (const v of t.variants) {
           const row = el('div', null, v.album_name + ' (' + v.album_type + ', ' + (v.release_date || '').slice(0, 4) + ')');
-          row.onclick = () => playUris([v.uri]);
+          row.onclick = () => playUris([v.uri, ...queueFrom(i + 1)]);
           variants.appendChild(row);
         }
         list.appendChild(variants);
       }
-    }
+    });
     view.appendChild(list);
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
@@ -928,13 +953,17 @@ function renderAlbumView(album) {
 
   const list = el('ul', 'list');
   for (const t of album.tracks) {
+    // Start the real album context at this track (not just a single-track
+    // queue), so playback continues through the rest of the album afterward --
+    // same continuation behavior as "Play album".
+    const playFromHere = () => playUris(null, 'spotify:album:' + album.id, {uri: t.uri});
     const li = el('li');
     const meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', t.track_number + '. ' + t.name));
     meta.appendChild(el('div', 'sub', (t.artists || []).join(', ') + ' · ' + fmtDuration(t.duration_ms)));
-    meta.onclick = () => playUris([t.uri]);
+    meta.onclick = playFromHere;
     li.appendChild(meta);
-    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = () => playUris([t.uri]);
+    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
     li.appendChild(playBtn);
     list.appendChild(li);
   }
@@ -944,21 +973,21 @@ function renderAlbumView(album) {
 // ---- now playing / transport ----
 
 document.getElementById('npPrev').onclick = async () => {
-  ensureAudioUnlocked();
+  await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   await api('/spotify-api/player/previous', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
 };
 document.getElementById('npNext').onclick = async () => {
-  ensureAudioUnlocked();
+  await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   await api('/spotify-api/player/next', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
 };
 document.getElementById('npPlay').onclick = async () => {
-  ensureAudioUnlocked();
+  await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   const np = await api('/spotify-api/player/now-playing');
