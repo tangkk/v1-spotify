@@ -1222,8 +1222,20 @@ document.getElementById('npPlay').onclick = async () => {
   const device_id = await ensureDevice();
   if (!device_id) return;
   const np = await api('/spotify-api/player/now-playing');
-  const path = np.playing ? '/spotify-api/player/pause' : '/spotify-api/player/play';
-  await api(path, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
+  if (np.playing) {
+    await api('/spotify-api/player/pause', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
+  } else if (np.live === false && np.track) {
+    // np.live===false means this is the cached snapshot from before a reload
+    // -- this device_id is brand new and was never given a context to resume,
+    // so a bare "play" has nothing to continue. Explicitly restart the same
+    // track at its saved position instead of silently doing nothing.
+    const body = {device_id, position_ms: np.progress_ms || 0};
+    if (np.track.album_id) { body.context_uri = 'spotify:album:' + np.track.album_id; body.offset = {uri: np.track.uri}; }
+    else { body.uris = [np.track.uri]; }
+    await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  } else {
+    await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
+  }
   pollNowPlaying();
 };
 document.getElementById('npVolume').onchange = async e => {
