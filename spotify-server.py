@@ -34,8 +34,11 @@ Routes:
   PUT  /spotify-api/player/play       {"device_id", "uris"|"context_uri", "offset", "position_ms"}
   PUT  /spotify-api/player/pause      {"device_id"}
   PUT  /spotify-api/player/volume?value=0..100&device_id=...
+  PUT  /spotify-api/player/seek?position_ms=&device_id=...
   POST /spotify-api/player/next       {"device_id"}
   POST /spotify-api/player/previous   {"device_id"}
+  GET  /spotify-api/view-state        -> {"view": {...}|null, "updated_at", "updated_by"}
+  PUT  /spotify-api/view-state        {"view": {...}, "client_id": "..."} -- cross-device "what's on screen" sync
 """
 import base64
 import json
@@ -79,6 +82,25 @@ _search_cache = {}
 _search_cache_lock = threading.Lock()
 _token_lock = threading.Lock()
 _token_cache = {"access_token": None, "expires_at": 0.0}
+
+# In-memory "what is everyone currently looking at" pointer, shared across every
+# browser/device using this single-user Spotify link, so e.g. opening an artist
+# on the phone also switches the laptop's page to that artist. Not persisted --
+# it's just a UI convenience, not data, so it resetting on a service restart is fine.
+_view_state_lock = threading.Lock()
+_view_state = {"view": None, "updated_at": 0.0, "updated_by": None}
+
+
+def set_view_state(view, client_id):
+    with _view_state_lock:
+        _view_state["view"] = view
+        _view_state["updated_at"] = time.time()
+        _view_state["updated_by"] = client_id
+
+
+def get_view_state():
+    with _view_state_lock:
+        return dict(_view_state)
 
 
 # ---------------------------------------------------------------- storage --
@@ -457,14 +479,14 @@ SPOTIFY_PAGE = r"""<!doctype html>
   #nowplaying .track .title { font-size:13px; }
   #nowplaying .track .sub { font-size:11px; color:#666; }
   #nowplaying .controls { display:flex; align-items:center; gap:6px; flex:none; }
-  #nowplaying .controls button { border:1px solid #000; background:#fff; padding:6px 10px;
-                                  font:inherit; font-size:12px; cursor:pointer; }
+  #nowplaying .controls button { border:1px solid #000; background:#fff; color:#000; padding:6px 10px;
+                                  font:inherit; font-size:12px; cursor:pointer; -webkit-appearance:none; appearance:none; }
   #nowplaying .controls button:hover { background:#f0f0f0; }
   #nowplaying .controls button#npPlay { min-width:52px; }
   #nowplaying .volume { display:flex; align-items:center; flex:none; }
   #nowplaying .volume input[type=range] { width:70px; accent-color:#000; }
-  #nowplaying .progress-row { display:flex; align-items:center; gap:8px; }
-  #nowplaying .progress-row input[type=range] { flex:1; min-width:0; accent-color:#000; }
+  #nowplaying .progress-row { display:flex; align-items:center; gap:8px; order:-1; }
+  #nowplaying .progress-row input[type=range] { flex:1; min-width:0; accent-color:#000; touch-action:none; cursor:pointer; }
   #nowplaying .progress-row .time { font-size:11px; color:#666; font-variant-numeric:tabular-nums; flex:none; min-width:34px; }
   #nowplaying .progress-row .time.start { text-align:left; }
   #nowplaying .progress-row .time.end { text-align:right; }
@@ -514,19 +536,26 @@ SPOTIFY_PAGE = r"""<!doctype html>
   </div>
   <div class="progress-row">
     <span class="time start" id="npElapsed">0:00</span>
-    <input type="range" id="npProgress" min="0" max="1000" value="0" disabled>
+    <input type="range" id="npProgress" min="0" max="1000" value="0">
     <span class="time end" id="npDuration">0:00</span>
   </div>
 </div>
 
 <script src="https://sdk.scdn.co/spotify-player.js"></script>
 <script>
+function getClientId() {
+  let id = localStorage.getItem('spotify_client_id');
+  if (!id) { id = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)); localStorage.setItem('spotify_client_id', id); }
+  return id;
+}
+
 const state = {
   linked: false,
   showCovers: localStorage.getItem('spotify_show_covers') !== '0',
   deviceId: null,
   devices: [],
   player: null,
+  clientId: getClientId(),
 };
 
 function api(path, opts) {
@@ -576,6 +605,9 @@ function renderLinkPanel(status) {
   panel.appendChild(row);
 }
 
+let sdkConnectTriggered = false;
+let deviceReadyWaiters = [];
+
 function initSDK() {
   window.onSpotifyWebPlaybackSDKReady = () => {
     const player = new Spotify.Player({
@@ -584,17 +616,38 @@ function initSDK() {
       volume: 0.7,
     });
     state.player = player;
-    player.addListener('ready', ({device_id}) => { state.deviceId = device_id; });
+    player.addListener('ready', ({device_id}) => {
+      state.deviceId = device_id;
+      deviceReadyWaiters.forEach(fn => fn(device_id));
+      deviceReadyWaiters = [];
+    });
     player.addListener('not_ready', () => { state.deviceId = null; });
     player.addListener('initialization_error', ({message}) => console.error('spotify init error', message));
     player.addListener('authentication_error', ({message}) => console.error('spotify auth error', message));
     player.addListener('account_error', ({message}) => console.error('spotify account error (需要 Premium)', message));
-    // No manual "Enable Playback" step: connect right away. This only opens the
-    // Spotify Connect control channel (no audio yet), so it isn't subject to the
-    // browser's user-gesture autoplay restriction -- that restriction only kicks
-    // in later, when a real Play click actually starts audio.
-    player.connect();
   };
+}
+
+// iOS/Safari requires connect() (and, where supported, activateElement()) to
+// happen inside a real synchronous click handler or there is no audio at all --
+// calling this is not a separate "Enable Playback" step for the user, it just
+// has to be the very first statement of whichever click actually starts
+// playback, so the browser still counts it as the same user gesture.
+function ensureAudioUnlocked() {
+  if (!state.player || sdkConnectTriggered) return;
+  sdkConnectTriggered = true;
+  if (typeof state.player.activateElement === 'function') {
+    try { state.player.activateElement(); } catch (e) {}
+  }
+  state.player.connect();
+}
+
+function waitForDeviceReady(timeoutMs) {
+  if (state.deviceId) return Promise.resolve(state.deviceId);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    deviceReadyWaiters.push(id => { clearTimeout(timer); resolve(id); });
+  });
 }
 
 async function refreshDevices() {
@@ -604,18 +657,25 @@ async function refreshDevices() {
   } catch (e) {}
 }
 
-// This browser's own SDK device is always the preferred playback target
-// (that is the whole point of "browser as the player"); only fall back to
-// whatever Spotify Connect device is already active if the SDK isn't ready.
+// This browser's own SDK device is always the preferred playback target --
+// that's the whole point of "whichever device you clicked Play on is the one
+// that should make sound" -- so if we just triggered connect(), wait a few
+// seconds for this device to actually come online before falling back to
+// whatever other Spotify Connect device happens to be active.
 async function ensureDevice() {
   if (state.deviceId) return state.deviceId;
+  if (sdkConnectTriggered) {
+    const id = await waitForDeviceReady(4000);
+    if (id) return id;
+  }
   await refreshDevices();
   const active = state.devices.find(d => d.is_active) || state.devices[0];
-  if (!active) { alert('没有可用的 Spotify 设备，请先点 Enable Playback，或在手机/电脑上打开 Spotify。'); return null; }
+  if (!active) { alert('没有可用的 Spotify 设备，请重试一次，或在手机/电脑上打开 Spotify。'); return null; }
   return active.id;
 }
 
 async function playUris(uris, contextUri, offset) {
+  ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   const body = {device_id};
@@ -649,10 +709,46 @@ function coverImg(url, cls) {
   return img;
 }
 
-document.getElementById('searchButton').onclick = doSearch;
+// ---- cross-device view sync ----
+// Every device sharing this Spotify link polls a tiny server-side pointer for
+// "what is currently on screen"; whichever device navigates writes it, the
+// others pick it up on their next poll and re-fetch+render the same view
+// themselves (only a {type, id/query} pointer is shared, never rendered HTML
+// or search result payloads, so it stays cheap and always up to date).
+
+let lastAppliedViewAt = 0;
+
+function pushViewState(view) {
+  api('/spotify-api/view-state', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({view, client_id: state.clientId})}).catch(() => {});
+}
+
+async function applyRemoteView(view) {
+  if (!view) { lastView = {type: 'search'}; document.getElementById('view').innerHTML = ''; return; }
+  if (view.type === 'home') { lastView = {type: 'search'}; document.getElementById('view').innerHTML = ''; }
+  else if (view.type === 'search') { document.getElementById('searchInput').value = view.query || ''; await doSearch(false); }
+  else if (view.type === 'artist') await openArtist(view.id, view.name, false);
+  else if (view.type === 'album') await openAlbum(view.id, false);
+  else if (view.type === 'dedup') await openDedup({id: view.id, name: view.name}, false);
+}
+
+async function pollViewState() {
+  try {
+    const remote = await api('/spotify-api/view-state');
+    if (remote.updated_by === state.clientId) { lastAppliedViewAt = remote.updated_at || lastAppliedViewAt; return; }
+    if (!remote.updated_at || remote.updated_at <= lastAppliedViewAt) return;
+    // Don't yank the search box away while this device is mid-typing.
+    if (document.activeElement === document.getElementById('searchInput')) return;
+    lastAppliedViewAt = remote.updated_at;
+    await applyRemoteView(remote.view);
+  } catch (e) {}
+}
+setInterval(pollViewState, 3000);
+
+document.getElementById('searchButton').onclick = () => doSearch();
 document.getElementById('searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 
-async function doSearch() {
+async function doSearch(push) {
   const q = document.getElementById('searchInput').value.trim();
   const err = document.getElementById('searchError');
   err.textContent = '';
@@ -664,6 +760,7 @@ async function doSearch() {
     ]);
     lastView = {type: 'searchResults', artists: artists.items, albums: albums.items};
     renderSearchResults(artists.items, albums.items);
+    if (push !== false) pushViewState({type: 'search', query: q});
   } catch (e) { err.textContent = '搜索失败：' + e.message; }
 }
 
@@ -708,16 +805,14 @@ function renderSearchResults(artists, albums) {
   view.appendChild(cols);
 }
 
-async function openArtist(id, name) {
+async function openArtist(id, name, push) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const [albums, dedup] = await Promise.all([
-      api('/spotify-api/artists/' + id + '/albums'),
-      Promise.resolve(null),
-    ]);
+    const albums = await api('/spotify-api/artists/' + id + '/albums');
     lastView = {type: 'artist', artist: {id, name, albums: albums.items}};
     renderArtistView(lastView.artist);
+    if (push !== false) pushViewState({type: 'artist', id, name});
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
@@ -725,7 +820,7 @@ function renderArtistView(artist) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const crumbs = el('div', 'crumbs');
-  const back = el('a', null, '← Search'); back.onclick = () => { lastView = {type: 'search'}; view.innerHTML = ''; };
+  const back = el('a', null, '← Search'); back.onclick = () => { lastView = {type: 'search'}; view.innerHTML = ''; pushViewState({type: 'home'}); };
   crumbs.appendChild(back);
   view.appendChild(crumbs);
   view.appendChild(el('h2', null, artist.name));
@@ -755,17 +850,19 @@ function renderArtistView(artist) {
   }
 }
 
-async function openDedup(artist) {
+async function openDedup(artist, push) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Building deduplicated list…</div>';
   try {
     const {items} = await api('/spotify-api/artists/' + artist.id + '/dedup-tracks');
     view.innerHTML = '';
     const crumbs = el('div', 'crumbs');
-    const back = el('a', null, '← ' + artist.name); back.onclick = () => renderArtistView(artist);
+    const back = el('a', null, '← ' + artist.name);
+    back.onclick = () => { renderArtistView(artist); pushViewState({type: 'artist', id: artist.id, name: artist.name}); };
     crumbs.appendChild(back);
     view.appendChild(crumbs);
     view.appendChild(el('h2', null, artist.name + ' · Deduplicated (' + items.length + ' songs)'));
+    if (push !== false) pushViewState({type: 'dedup', id: artist.id, name: artist.name});
     const playAll = el('button', 'button primary small', 'Play all');
     playAll.onclick = () => playUris(items.slice(0, 50).map(t => t.uri));
     view.appendChild(playAll);
@@ -797,13 +894,14 @@ async function openDedup(artist) {
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
-async function openAlbum(id) {
+async function openAlbum(id, push) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const album = await api('/spotify-api/albums/' + id);
     lastView = {type: 'album', album};
     renderAlbumView(album);
+    if (push !== false) pushViewState({type: 'album', id});
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
@@ -811,7 +909,7 @@ function renderAlbumView(album) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const crumbs = el('div', 'crumbs');
-  const back = el('a', null, '← Search'); back.onclick = () => { lastView = {type: 'search'}; view.innerHTML = ''; };
+  const back = el('a', null, '← Search'); back.onclick = () => { lastView = {type: 'search'}; view.innerHTML = ''; pushViewState({type: 'home'}); };
   crumbs.appendChild(back);
   view.appendChild(crumbs);
 
@@ -846,18 +944,21 @@ function renderAlbumView(album) {
 // ---- now playing / transport ----
 
 document.getElementById('npPrev').onclick = async () => {
+  ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   await api('/spotify-api/player/previous', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
 };
 document.getElementById('npNext').onclick = async () => {
+  ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   await api('/spotify-api/player/next', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
 };
 document.getElementById('npPlay').onclick = async () => {
+  ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   const np = await api('/spotify-api/player/now-playing');
@@ -893,23 +994,40 @@ async function pollNowPlaying() {
 }
 setInterval(pollNowPlaying, 5000);
 
+// While the user is actively dragging the thumb, the 250ms auto-render must
+// not fight the drag by snapping the value back to the last poll's position.
+let draggingProgress = false;
+const progressInput = document.getElementById('npProgress');
+
+progressInput.addEventListener('input', () => {
+  draggingProgress = true;
+  document.getElementById('npElapsed').textContent = fmtDuration(Number(progressInput.value));
+});
+progressInput.addEventListener('change', async () => {
+  const position_ms = Math.round(Number(progressInput.value));
+  const device_id = await ensureDevice();
+  draggingProgress = false;
+  if (!device_id) return;
+  await api('/spotify-api/player/seek?position_ms=' + position_ms + '&device_id=' + encodeURIComponent(device_id), {method: 'PUT'});
+  if (npState) { npState.progressMs = position_ms; npState.at = Date.now(); }
+});
+
 function renderProgress() {
-  const progressEl = document.getElementById('npProgress');
   const elapsedEl = document.getElementById('npElapsed');
   const durationEl = document.getElementById('npDuration');
   if (!npState || !npState.durationMs) {
-    progressEl.value = 0;
-    elapsedEl.textContent = '0:00';
+    if (!draggingProgress) { progressInput.value = 0; elapsedEl.textContent = '0:00'; }
     durationEl.textContent = '0:00';
     return;
   }
+  progressInput.max = npState.durationMs;
+  durationEl.textContent = fmtDuration(npState.durationMs);
+  if (draggingProgress) return;
   let pos = npState.progressMs;
   if (npState.playing) pos += Date.now() - npState.at;
   pos = Math.max(0, Math.min(pos, npState.durationMs));
-  progressEl.max = npState.durationMs;
-  progressEl.value = pos;
+  progressInput.value = pos;
   elapsedEl.textContent = fmtDuration(pos);
-  durationEl.textContent = fmtDuration(npState.durationMs);
 }
 setInterval(renderProgress, 250);
 
@@ -924,6 +1042,8 @@ setInterval(renderProgress, 250);
     if (status.linked) {
       document.getElementById('searchPanel').style.display = '';
       pollNowPlaying();
+      const remote = await api('/spotify-api/view-state');
+      if (remote.view) { lastAppliedViewAt = remote.updated_at || 0; await applyRemoteView(remote.view); }
     }
   } catch (e) {
     document.getElementById('linkPanel').textContent = '状态加载失败：' + e.message;
@@ -1046,6 +1166,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_devices(); return
         if path == "/spotify-api/player/now-playing":
             self.handle_now_playing(); return
+        if path == "/spotify-api/view-state":
+            self.send_json(200, get_view_state()); return
         match = ARTIST_ALBUMS_RE.match(path)
         if match:
             self.handle_artist_albums(match.group(1), query); return
@@ -1237,6 +1359,21 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_json(400, {"error": "invalid_value"}); return
             spotify_api("PUT", "/me/player/volume", params={"volume_percent": volume, "device_id": device_id})
+            self.send_json(200, {"ok": True}); return
+        if path == "/spotify-api/player/seek":
+            value = query.get("position_ms", [None])[0]
+            device_id = query.get("device_id", [None])[0]
+            if value is None:
+                self.send_json(400, {"error": "missing_position_ms"}); return
+            try:
+                position_ms = max(0, int(value))
+            except ValueError:
+                self.send_json(400, {"error": "invalid_position_ms"}); return
+            spotify_api("PUT", "/me/player/seek", params={"position_ms": position_ms, "device_id": device_id})
+            self.send_json(200, {"ok": True}); return
+        if path == "/spotify-api/view-state":
+            body = self.read_json_body()
+            set_view_state(body.get("view"), body.get("client_id"))
             self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
