@@ -25,6 +25,7 @@ Routes:
   GET  /spotify-api/player-token          -> short-lived access_token for the Web Playback SDK
   GET  /spotify-api/search/artists?q=
   GET  /spotify-api/search/albums?q=
+  GET  /spotify-api/search/tracks?q=
   GET  /spotify-api/artists/<id>/albums
   GET  /spotify-api/artists/<id>/dedup-tracks
   GET  /spotify-api/albums/<id>
@@ -523,6 +524,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
   #nowplaying .main-row { display:flex; align-items:center; gap:12px; }
   #nowplaying .track { flex:1; min-width:0; }
   #nowplaying .track .title { font-size:13px; }
+  #nowplaying .track .title:hover { text-decoration:underline; }
   #nowplaying .track .sub { font-size:11px; color:#666; }
   #nowplaying .controls { display:flex; align-items:center; gap:6px; flex:none; }
   #nowplaying .controls button { border:1px solid #000; background:#fff; color:#000; padding:6px 10px;
@@ -915,15 +917,16 @@ async function runSearch(query) {
   err.textContent = '';
   if (!query) return;
   try {
-    const [artists, albums] = await Promise.all([
+    const [artists, albums, tracks] = await Promise.all([
       api('/spotify-api/search/artists?q=' + encodeURIComponent(query)),
       api('/spotify-api/search/albums?q=' + encodeURIComponent(query)),
+      api('/spotify-api/search/tracks?q=' + encodeURIComponent(query)),
     ]);
-    renderSearchResults(artists.items, albums.items);
+    renderSearchResults(artists.items, albums.items, tracks.items);
   } catch (e) { err.textContent = 'Search failed: ' + e.message; }
 }
 
-function renderSearchResults(artists, albums) {
+function renderSearchResults(artists, albums, tracks) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const cols = el('div', ''); cols.id = 'columns';
@@ -959,8 +962,30 @@ function renderSearchResults(artists, albums) {
   }
   albumCol.appendChild(albumList);
 
+  const trackCol = el('div');
+  trackCol.appendChild(el('h2', null, 'Tracks'));
+  const trackList = el('ul', 'list');
+  if (!tracks.length) trackList.appendChild(el('li', 'empty', 'No tracks'));
+  for (const t of tracks) {
+    // Start the track's own album context at this track, same continuation
+    // behavior as every other play entry point in the app.
+    const playFromHere = () => playUris(null, 'spotify:album:' + t.album_id, {uri: t.uri});
+    const li = el('li');
+    li.appendChild(coverImg(t.image));
+    const meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', t.name));
+    meta.appendChild(el('div', 'sub', t.artists.join(', ') + ' · ' + t.album_name + ' · ' + fmtDuration(t.duration_ms)));
+    meta.onclick = playFromHere;
+    li.appendChild(meta);
+    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
+    li.appendChild(playBtn);
+    trackList.appendChild(li);
+  }
+  trackCol.appendChild(trackList);
+
   cols.appendChild(artistCol);
   cols.appendChild(albumCol);
+  cols.appendChild(trackCol);
   view.appendChild(cols);
 }
 
@@ -1202,7 +1227,10 @@ async function pollNowPlaying() {
     const cover = document.getElementById('npCover');
     cover.dataset.src = np.track.image || '';
     if (state.showCovers && np.track.image) { cover.src = np.track.image; cover.style.display = ''; } else { cover.style.display = 'none'; }
-    document.getElementById('npTitle').textContent = np.track.name;
+    const npTitle = document.getElementById('npTitle');
+    npTitle.textContent = np.track.name;
+    npTitle.onclick = np.track.album_id ? (() => goTo({type: 'album', id: np.track.album_id})) : null;
+    npTitle.style.cursor = np.track.album_id ? 'pointer' : '';
     document.getElementById('npSub').textContent = np.track.artists.join(', ') + ' · ' + (np.device || '');
     document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
     const nearEnd = np.track.duration_ms && (np.progress_ms >= np.track.duration_ms - 2000);
@@ -1383,6 +1411,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_search("artist", query); return
         if path == "/spotify-api/search/albums":
             self.handle_search("album", query); return
+        if path == "/spotify-api/search/tracks":
+            self.handle_search("track", query); return
         if path == "/spotify-api/devices":
             self.handle_devices(); return
         if path == "/spotify-api/player/now-playing":
@@ -1479,6 +1509,17 @@ class Handler(BaseHTTPRequestHandler):
         for item in items:
             if not item:
                 continue
+            if kind == "track":
+                album = item.get("album") or {}
+                images = album.get("images") or []
+                out.append({
+                    "id": item["id"], "name": item["name"], "uri": item["uri"],
+                    "image": images[0]["url"] if images else None,
+                    "artists": [a["name"] for a in item.get("artists", [])],
+                    "album_id": album.get("id"), "album_name": album.get("name", ""),
+                    "duration_ms": item.get("duration_ms", 0),
+                })
+                continue
             images = item.get("images") or []
             entry = {"id": item["id"], "name": item["name"],
                      "image": images[0]["url"] if images else None, "uri": item["uri"]}
@@ -1537,7 +1578,8 @@ class Handler(BaseHTTPRequestHandler):
             "device_id": device.get("id"),
             "track": None if not item else {
                 "name": item.get("name"), "artists": [a["name"] for a in item.get("artists", [])],
-                "album": item.get("album", {}).get("name"), "duration_ms": item.get("duration_ms", 0),
+                "album": item.get("album", {}).get("name"), "album_id": item.get("album", {}).get("id"),
+                "duration_ms": item.get("duration_ms", 0),
                 "image": images[0]["url"] if images else None, "uri": item.get("uri"),
             },
         })
