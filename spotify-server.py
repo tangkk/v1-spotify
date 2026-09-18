@@ -507,12 +507,11 @@ SPOTIFY_PAGE = r"""<!doctype html>
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
          touch-action:manipulation; background:#fff; color:#000; min-height:100vh;
          padding:20px 20px 96px; }
-  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; gap:12px; }
-  h1 { font-size:20px; margin:0; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
+  .logo { height:32px; width:32px; display:block; }
   .header-right { display:flex; align-items:center; gap:10px; }
   #authStatus { font-size:12px; color:#666; text-align:right; }
   #authStatus a { color:#666; text-decoration:underline; cursor:pointer; margin-left:8px; }
-  .hint { color:#666; font-size:13px; line-height:1.5; margin:0 0 18px; }
   .panel { border:1px solid #000; padding:14px 16px; margin-bottom:20px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .button { padding:8px 16px; border:1px solid #000; background:#fff; color:#000;
@@ -577,13 +576,12 @@ SPOTIFY_PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Spotify</h1>
+  <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo">
   <div class="header-right">
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
     <div id="authStatus"></div>
   </div>
 </header>
-<p class="hint">Search by artist or album. Music and artwork stream directly from Spotify to this browser; V1 only handles search, auth, and playback control.</p>
 
 <div id="connectPanel" class="panel" style="display:none"></div>
 
