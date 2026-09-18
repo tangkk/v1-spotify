@@ -156,6 +156,16 @@ def db():
         image TEXT,
         added_at INTEGER NOT NULL
     )""")
+    # Added later than the table itself; ALTER TABLE has no "IF NOT EXISTS"
+    # in sqlite, so ignore the "duplicate column" error on every run after
+    # the first.
+    for stmt in ("ALTER TABLE favorite_albums ADD COLUMN album_type TEXT",
+                 "ALTER TABLE favorite_albums ADD COLUMN release_date TEXT",
+                 "ALTER TABLE favorite_albums ADD COLUMN tracks TEXT"):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
@@ -190,13 +200,21 @@ def clear_account():
     clear_last_playback()
 
 
-def add_favorite(album_id, name, artists, image):
+def add_favorite(album_id, name, artists, image, album_type=None, release_date=None, tracks=None):
+    # tracks (and album_type/release_date) are optional: favoriting from the
+    # album page sends the full detail already on screen so no extra Spotify
+    # call is needed, but COALESCE keeps any previously-cached tracks intact
+    # if a caller ever re-favorites without that data (e.g. an older client).
     with db() as conn:
-        conn.execute("""INSERT INTO favorite_albums(id, name, artists, image, added_at)
-                         VALUES (?, ?, ?, ?, ?)
+        conn.execute("""INSERT INTO favorite_albums(id, name, artists, image, album_type, release_date, tracks, added_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT(id) DO UPDATE SET
-                             name=excluded.name, artists=excluded.artists, image=excluded.image""",
-                     (album_id, name, json.dumps(artists or []), image, int(time.time())))
+                             name=excluded.name, artists=excluded.artists, image=excluded.image,
+                             album_type=COALESCE(excluded.album_type, favorite_albums.album_type),
+                             release_date=COALESCE(excluded.release_date, favorite_albums.release_date),
+                             tracks=COALESCE(excluded.tracks, favorite_albums.tracks)""",
+                     (album_id, name, json.dumps(artists or []), image, album_type, release_date,
+                      json.dumps(tracks) if tracks is not None else None, int(time.time())))
         conn.commit()
 
 
@@ -217,6 +235,19 @@ def is_favorite(album_id):
     with db() as conn:
         row = conn.execute("SELECT 1 FROM favorite_albums WHERE id=?", (album_id,)).fetchone()
     return row is not None
+
+
+def get_favorite_album_detail(album_id):
+    """Cached full album+tracks for a favorited album, or None if it isn't
+    favorited or hasn't been cached yet (favorited before this existed)."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, name, artists, image, album_type, release_date, tracks FROM favorite_albums WHERE id=?",
+            (album_id,)).fetchone()
+    if not row or not row[6]:
+        return None
+    return {"id": row[0], "name": row[1], "artists": json.loads(row[2]), "image": row[3],
+            "album_type": row[4], "release_date": row[5], "tracks": json.loads(row[6])}
 
 
 # ------------------------------------------------------------- spotify io --
@@ -1183,8 +1214,11 @@ async function renderAlbumView(album) {
     favorited = !favorited;
     syncFavBtn();
     if (favorited) {
+      // Send the full album + tracks already on screen so the backend can
+      // cache it and never has to call Spotify again for this album.
       await api('/spotify-api/favorites/' + album.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: album.name, artists: album.artists, image: album.image})});
+        body: JSON.stringify({name: album.name, artists: album.artists, image: album.image,
+                               album_type: album.album_type, release_date: album.release_date, tracks: album.tracks})});
     } else {
       await api('/spotify-api/favorites/' + album.id, {method: 'DELETE'});
     }
@@ -1631,10 +1665,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"items": build_dedup_tracks(artist_id, groups)})
 
     def handle_album(self, album_id):
+        # Favorited albums are a small, stable set -- serve them straight from
+        # sqlite with zero Spotify calls once cached, instead of re-fetching
+        # metadata + tracks (paginated at this app's limit=10) every visit.
+        cached = get_favorite_album_detail(album_id)
+        if cached:
+            self.send_json(200, cached)
+            return
         album = spotify_api("GET", f"/albums/{album_id}")
         tracks = fetch_album_tracks(album_id)
         images = album.get("images") or []
-        self.send_json(200, {
+        result = {
             "id": album["id"], "name": album["name"], "album_type": album.get("album_type", ""),
             "release_date": album.get("release_date", ""), "image": images[0]["url"] if images else None,
             "artists": [a["name"] for a in album.get("artists", [])],
@@ -1642,7 +1683,14 @@ class Handler(BaseHTTPRequestHandler):
                         "track_number": t.get("track_number", 0), "disc_number": t.get("disc_number", 1),
                         "duration_ms": t.get("duration_ms", 0),
                         "artists": [a["name"] for a in t.get("artists", [])]} for t in tracks],
-        })
+        }
+        # Backfill the cache if this was already favorited before caching
+        # existed (or before this album's page had ever been opened), so the
+        # next view is free.
+        if is_favorite(album_id):
+            add_favorite(album_id, result["name"], result["artists"], result["image"],
+                         result["album_type"], result["release_date"], result["tracks"])
+        self.send_json(200, result)
 
     def handle_devices(self):
         result = spotify_api("GET", "/me/player/devices")
@@ -1746,7 +1794,8 @@ class Handler(BaseHTTPRequestHandler):
         match = FAVORITE_RE.match(path)
         if match:
             body = self.read_json_body()
-            add_favorite(match.group(1), body.get("name", ""), body.get("artists"), body.get("image"))
+            add_favorite(match.group(1), body.get("name", ""), body.get("artists"), body.get("image"),
+                         body.get("album_type"), body.get("release_date"), body.get("tracks"))
             self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
