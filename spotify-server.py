@@ -362,12 +362,53 @@ def build_dedup_tracks(artist_id, groups):
 
 # -------------------------------------------------------------- frontend --
 
+# Same black-on-white-rounded-square visual language as files-server.py's
+# FILES_ICON / MEDIA_ICON (stroke only, no fill besides the background).
+SPOTIFY_ICON = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="14" fill="#ffffff"/>
+<path d="M20 40 V24 M32 44 V16 M44 40 V28" fill="none" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+</svg>'''
+
+SPOTIFY_APPLE_ICON = base64.b64decode(
+    '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'
+    'gP8H74XWaTHJpfIAAAAASUVORK5CYII='
+)
+
 SPOTIFY_PAGE = r"""<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Spotify</title>
+<link rel="icon" href="/spotify-api/icon-v2.svg" type="image/svg+xml" sizes="any">
+<link rel="apple-touch-icon" sizes="180x180" href="/spotify-api/apple-touch-icon-v2.png">
 <style>
   * { box-sizing:border-box; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
@@ -410,14 +451,27 @@ SPOTIFY_PAGE = r"""<!doctype html>
   .crumbs { font-size:13px; color:#666; margin-bottom:6px; }
   .crumbs a { color:#000; text-decoration:none; cursor:pointer; }
   #nowplaying { position:fixed; left:0; right:0; bottom:0; background:#fff; border-top:1px solid #000;
-                padding:10px 16px; display:none; align-items:center; gap:12px; }
+                padding:8px 16px 10px; display:none; flex-direction:column; gap:6px; }
+  #nowplaying .main-row { display:flex; align-items:center; gap:12px; }
   #nowplaying .track { flex:1; min-width:0; }
   #nowplaying .track .title { font-size:13px; }
   #nowplaying .track .sub { font-size:11px; color:#666; }
-  #nowplaying .controls { display:flex; align-items:center; gap:6px; }
-  #nowplaying .controls button { border:1px solid #000; background:#fff; width:32px; height:32px; cursor:pointer; }
+  #nowplaying .controls { display:flex; align-items:center; gap:6px; flex:none; }
+  #nowplaying .controls button { border:1px solid #000; background:#fff; padding:6px 10px;
+                                  font:inherit; font-size:12px; cursor:pointer; }
   #nowplaying .controls button:hover { background:#f0f0f0; }
-  #nowplaying input[type=range] { width:70px; accent-color:#000; }
+  #nowplaying .controls button#npPlay { min-width:52px; }
+  #nowplaying .volume { display:flex; align-items:center; flex:none; }
+  #nowplaying .volume input[type=range] { width:70px; accent-color:#000; }
+  #nowplaying .progress-row { display:flex; align-items:center; gap:8px; }
+  #nowplaying .progress-row input[type=range] { flex:1; min-width:0; accent-color:#000; }
+  #nowplaying .progress-row .time { font-size:11px; color:#666; font-variant-numeric:tabular-nums; flex:none; min-width:34px; }
+  #nowplaying .progress-row .time.start { text-align:left; }
+  #nowplaying .progress-row .time.end { text-align:right; }
+  @media (max-width: 520px) {
+    #nowplaying .track .sub { display:none; }
+    #nowplaying .controls button { padding:6px 8px; font-size:11px; }
+  }
   #columns { display:flex; gap:24px; flex-wrap:wrap; }
   #columns > div { flex:1; min-width:260px; }
 </style>
@@ -443,18 +497,26 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <div id="view"></div>
 
 <div id="nowplaying">
-  <img id="npCover" class="cover" style="display:none">
-  <div class="track">
-    <div class="title" id="npTitle">-</div>
-    <div class="sub" id="npSub"></div>
+  <div class="main-row">
+    <img id="npCover" class="cover" style="display:none">
+    <div class="track">
+      <div class="title" id="npTitle">-</div>
+      <div class="sub" id="npSub"></div>
+    </div>
+    <div class="controls">
+      <button id="npPrev">Prev</button>
+      <button id="npPlay">Play</button>
+      <button id="npNext">Next</button>
+    </div>
+    <div class="volume">
+      <input type="range" id="npVolume" min="0" max="100" value="70">
+    </div>
   </div>
-  <div class="controls">
-    <button id="npPrev" title="上一首">⏮</button>
-    <button id="npPlay" title="播放/暂停">⏯</button>
-    <button id="npNext" title="下一首">⏭</button>
+  <div class="progress-row">
+    <span class="time start" id="npElapsed">0:00</span>
+    <input type="range" id="npProgress" min="0" max="1000" value="0" disabled>
+    <span class="time end" id="npDuration">0:00</span>
   </div>
-  <input type="range" id="npVolume" min="0" max="100" value="70">
-  <select id="deviceSelect"></select>
 </div>
 
 <script src="https://sdk.scdn.co/spotify-player.js"></script>
@@ -464,7 +526,6 @@ const state = {
   showCovers: localStorage.getItem('spotify_show_covers') !== '0',
   deviceId: null,
   devices: [],
-  selectedDeviceId: localStorage.getItem('spotify_device_id') || null,
   player: null,
 };
 
@@ -513,12 +574,6 @@ function renderLinkPanel(status) {
   };
   row.appendChild(disconnect);
   panel.appendChild(row);
-  if (!state.deviceId) {
-    const enable = el('button', 'button primary', 'Enable Playback');
-    enable.style.marginTop = '10px';
-    enable.onclick = () => { if (state.player) state.player.connect(); enable.disabled = true; enable.textContent = 'Connecting…'; };
-    panel.appendChild(enable);
-  }
 }
 
 function initSDK() {
@@ -529,50 +584,35 @@ function initSDK() {
       volume: 0.7,
     });
     state.player = player;
-    player.addListener('ready', ({device_id}) => {
-      state.deviceId = device_id;
-      if (!state.selectedDeviceId) { state.selectedDeviceId = device_id; saveSelectedDevice(); }
-      refreshDevices();
-      document.getElementById('linkPanel').querySelector('button.primary')?.remove();
-    });
+    player.addListener('ready', ({device_id}) => { state.deviceId = device_id; });
     player.addListener('not_ready', () => { state.deviceId = null; });
     player.addListener('initialization_error', ({message}) => console.error('spotify init error', message));
     player.addListener('authentication_error', ({message}) => console.error('spotify auth error', message));
     player.addListener('account_error', ({message}) => console.error('spotify account error (需要 Premium)', message));
+    // No manual "Enable Playback" step: connect right away. This only opens the
+    // Spotify Connect control channel (no audio yet), so it isn't subject to the
+    // browser's user-gesture autoplay restriction -- that restriction only kicks
+    // in later, when a real Play click actually starts audio.
+    player.connect();
   };
-}
-
-function saveSelectedDevice() {
-  if (state.selectedDeviceId) localStorage.setItem('spotify_device_id', state.selectedDeviceId);
 }
 
 async function refreshDevices() {
   try {
     const {items} = await api('/spotify-api/devices');
     state.devices = items;
-    const sel = document.getElementById('deviceSelect');
-    sel.innerHTML = '';
-    if (state.deviceId && !items.some(d => d.id === state.deviceId)) {
-      const opt = el('option', null, 'This browser (V1 Spotify Player)');
-      opt.value = state.deviceId;
-      sel.appendChild(opt);
-    }
-    for (const d of items) {
-      const opt = el('option', null, d.name + (d.id === state.deviceId ? ' (this browser)' : ''));
-      opt.value = d.id;
-      sel.appendChild(opt);
-    }
-    if (state.selectedDeviceId) sel.value = state.selectedDeviceId;
-    if (!sel.value && sel.options.length) { sel.selectedIndex = 0; state.selectedDeviceId = sel.value; }
   } catch (e) {}
 }
 
-document.getElementById('deviceSelect').onchange = e => { state.selectedDeviceId = e.target.value; saveSelectedDevice(); };
-
+// This browser's own SDK device is always the preferred playback target
+// (that is the whole point of "browser as the player"); only fall back to
+// whatever Spotify Connect device is already active if the SDK isn't ready.
 async function ensureDevice() {
-  if (!state.selectedDeviceId) await refreshDevices();
-  if (!state.selectedDeviceId) { alert('没有可用的 Spotify 设备，请先点 Enable Playback，或在手机/电脑上打开 Spotify。'); return null; }
-  return state.selectedDeviceId;
+  if (state.deviceId) return state.deviceId;
+  await refreshDevices();
+  const active = state.devices.find(d => d.is_active) || state.devices[0];
+  if (!active) { alert('没有可用的 Spotify 设备，请先点 Enable Playback，或在手机/电脑上打开 Spotify。'); return null; }
+  return active.id;
 }
 
 async function playUris(uris, contextUri, offset) {
@@ -805,33 +845,73 @@ function renderAlbumView(album) {
 
 // ---- now playing / transport ----
 
-document.getElementById('npPrev').onclick = () => api('/spotify-api/player/previous', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id: state.selectedDeviceId})}).then(pollNowPlaying);
-document.getElementById('npNext').onclick = () => api('/spotify-api/player/next', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id: state.selectedDeviceId})}).then(pollNowPlaying);
-document.getElementById('npPlay').onclick = async () => {
-  const np = await api('/spotify-api/player/now-playing');
-  const path = np.playing ? '/spotify-api/player/pause' : '/spotify-api/player/play';
-  await api(path, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id: state.selectedDeviceId})});
+document.getElementById('npPrev').onclick = async () => {
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  await api('/spotify-api/player/previous', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
 };
-document.getElementById('npVolume').onchange = e => {
-  api('/spotify-api/player/volume?value=' + e.target.value + '&device_id=' + encodeURIComponent(state.selectedDeviceId || ''), {method: 'PUT'});
+document.getElementById('npNext').onclick = async () => {
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  await api('/spotify-api/player/next', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
+  pollNowPlaying();
 };
+document.getElementById('npPlay').onclick = async () => {
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  const np = await api('/spotify-api/player/now-playing');
+  const path = np.playing ? '/spotify-api/player/pause' : '/spotify-api/player/play';
+  await api(path, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
+  pollNowPlaying();
+};
+document.getElementById('npVolume').onchange = async e => {
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  api('/spotify-api/player/volume?value=' + e.target.value + '&device_id=' + encodeURIComponent(device_id), {method: 'PUT'});
+};
+
+// npState holds the last poll's snapshot; a fast local timer interpolates the
+// visible position between 5s polls so the progress bar moves smoothly
+// instead of jumping once every 5 seconds.
+let npState = null;
 
 async function pollNowPlaying() {
   try {
     const np = await api('/spotify-api/player/now-playing');
     const bar = document.getElementById('nowplaying');
-    if (!np.track) { bar.style.display = 'none'; return; }
+    if (!np.track) { bar.style.display = 'none'; npState = null; return; }
     bar.style.display = 'flex';
     const cover = document.getElementById('npCover');
     cover.style.display = state.showCovers && np.track.image ? '' : 'none';
     if (np.track.image) cover.src = np.track.image;
     document.getElementById('npTitle').textContent = np.track.name;
     document.getElementById('npSub').textContent = np.track.artists.join(', ') + ' · ' + (np.device || '');
-    document.getElementById('npPlay').textContent = np.playing ? '⏸' : '▶';
+    document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
+    npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
+
+function renderProgress() {
+  const progressEl = document.getElementById('npProgress');
+  const elapsedEl = document.getElementById('npElapsed');
+  const durationEl = document.getElementById('npDuration');
+  if (!npState || !npState.durationMs) {
+    progressEl.value = 0;
+    elapsedEl.textContent = '0:00';
+    durationEl.textContent = '0:00';
+    return;
+  }
+  let pos = npState.progressMs;
+  if (npState.playing) pos += Date.now() - npState.at;
+  pos = Math.max(0, Math.min(pos, npState.durationMs));
+  progressEl.max = npState.durationMs;
+  progressEl.value = pos;
+  elapsedEl.textContent = fmtDuration(pos);
+  durationEl.textContent = fmtDuration(npState.durationMs);
+}
+setInterval(renderProgress, 250);
 
 // ---- boot ----
 
@@ -878,6 +958,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_icon(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_apple_icon(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -928,6 +1026,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True}); return
         if path in ("/spotify", "/spotify/"):
             self.send_html(SPOTIFY_PAGE); return
+        if path == "/spotify-api/icon-v2.svg":
+            self.send_icon(SPOTIFY_ICON); return
+        if path == "/spotify-api/apple-touch-icon-v2.png":
+            self.send_apple_icon(SPOTIFY_APPLE_ICON); return
         if path == "/spotify-api/status":
             self.handle_status(); return
         if path == "/spotify-api/login":
