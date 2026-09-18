@@ -26,9 +26,9 @@ Routes:
   GET  /spotify-api/search/artists?q=&offset=  -> {"items", "offset", "total", "has_more"}
   GET  /spotify-api/search/albums?q=&offset=
   GET  /spotify-api/search/tracks?q=&offset=
-  GET  /spotify-api/artists/<id>/albums
+  GET  /spotify-api/artists/<id>/albums?refresh=1 -- bypass the permanent cache and re-fetch
   GET  /spotify-api/artists/<id>/dedup-tracks
-  GET  /spotify-api/albums/<id>
+  GET  /spotify-api/albums/<id>?refresh=1          -- bypass the permanent cache and re-fetch
   GET  /spotify-api/albums/<id>/next-in-artist -> {"next": {id, name, image}|null} -- same-artist auto-continue lookup
   GET  /spotify-api/devices
   GET  /spotify-api/recently-played
@@ -374,7 +374,17 @@ def spotify_api(method, path, params=None, body=None, retry=True):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
-            return json.loads(raw.decode("utf-8")) if raw else {}
+            if not raw.strip():
+                return {}
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except ValueError:
+                # Undocumented but real: POST .../player/queue returns 200
+                # with a bare opaque token ("L_GEVkWQD3v0..."), not JSON, on
+                # success. Every caller only reads specific keys via .get(),
+                # so treating any non-JSON success body as {} is safe -- the
+                # call still succeeded, we just have nothing structured back.
+                return {}
     except urllib.error.HTTPError as exc:
         if exc.code == 401 and retry:
             with _token_lock:
@@ -398,9 +408,9 @@ def cached_search(kind, query, limit, offset=0):
     return result
 
 
-def fetch_artist_albums(artist_id, groups, limit_total=200):
+def fetch_artist_albums(artist_id, groups, limit_total=200, force=False):
     cache_key = f"artist_albums:{artist_id}:{groups}"
-    cached = cache_get(cache_key)
+    cached = None if force else cache_get(cache_key)
     if cached is not None:
         return cached[:limit_total]
     albums = []
@@ -426,9 +436,9 @@ def fetch_artist_albums(artist_id, groups, limit_total=200):
     return result
 
 
-def fetch_album_meta(album_id):
+def fetch_album_meta(album_id, force=False):
     cache_key = f"album_meta:{album_id}"
-    cached = cache_get(cache_key)
+    cached = None if force else cache_get(cache_key)
     if cached is not None:
         return cached
     album = spotify_api("GET", f"/albums/{album_id}")
@@ -484,9 +494,9 @@ def track_summary(t):
             "duration_ms": t.get("duration_ms", 0)}
 
 
-def fetch_album_tracks(album_id, limit_total=300):
+def fetch_album_tracks(album_id, limit_total=300, force=False):
     cache_key = f"album_tracks:{album_id}"
-    cached = cache_get(cache_key)
+    cached = None if force else cache_get(cache_key)
     if cached is not None:
         return cached[:limit_total]
     tracks = []
@@ -653,8 +663,6 @@ SPOTIFY_PAGE = r"""<!doctype html>
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
   .logo { height:32px; width:32px; display:block; }
   .header-right { display:flex; align-items:center; gap:10px; }
-  #authStatus { font-size:12px; color:#666; text-align:right; }
-  #authStatus a { color:#666; text-decoration:underline; cursor:pointer; }
   .panel { border:1px solid #000; padding:14px 16px; margin-bottom:20px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .button { padding:8px 16px; border:1px solid #000; background:#fff; color:#000;
@@ -695,6 +703,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
   .variants div:hover { color:#000; }
   .empty { color:#999; padding:14px 0; text-align:center; font-size:13px; }
   .error { color:#b00020; font-size:13px; margin-top:8px; }
+  .toast { position:fixed; bottom:90px; left:50%; transform:translateX(-50%); background:#000; color:#fff;
+           padding:8px 16px; font-size:13px; z-index:1000; max-width:90vw; text-align:center; }
   .crumbs { font-size:13px; color:#666; margin-bottom:6px; }
   .crumbs a { color:#000; text-decoration:none; cursor:pointer; }
   #nowplaying { position:fixed; left:0; right:0; bottom:0; background:#fff; border-top:1px solid #000;
@@ -730,7 +740,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
     <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
-    <div id="authStatus"></div>
+    <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
 </header>
 
@@ -835,31 +845,20 @@ function applyCoversVisibility() {
 
 // ---- link status / SDK bootstrap ----
 
+// One icon button toggles between "Connect" and "Disconnect" instead of a
+// separate connect panel + a plain text link, so it lines up with the other
+// header icon buttons (recently played / queue / favorites) instead of
+// taking its own row.
 function renderAuthArea(status) {
-  const connectPanel = document.getElementById('connectPanel');
-  const authStatus = document.getElementById('authStatus');
-  connectPanel.style.display = 'none';
-  authStatus.textContent = '';
-  if (!status.linked) {
-    connectPanel.style.display = '';
-    connectPanel.innerHTML = '';
-    connectPanel.appendChild(el('div', 'muted', 'Not connected to Spotify.'));
-    const btn = el('button', 'button primary', 'Connect Spotify');
-    btn.style.marginTop = '10px';
-    btn.onclick = () => { window.location.href = '/spotify-api/login'; };
-    connectPanel.appendChild(btn);
-    return;
-  }
-  // Its mere presence already implies "connected" (connectPanel above covers
-  // the disconnected state), so no need for a "Connected as X" line here too
-  // -- kept minimal for iOS header space.
-  const disconnect = el('a', null, 'Disconnect');
-  disconnect.onclick = async () => {
+  document.getElementById('connectPanel').style.display = 'none';
+  const btn = document.getElementById('connectionButton');
+  btn.classList.toggle('active', status.linked);
+  btn.title = status.linked ? 'Disconnect Spotify' : 'Connect Spotify';
+  btn.onclick = status.linked ? async () => {
     if (!confirm('Disconnect Spotify?')) return;
     await api('/spotify-api/logout', {method: 'POST'});
     location.reload();
-  };
-  authStatus.appendChild(disconnect);
+  } : () => { window.location.href = '/spotify-api/login'; };
 }
 
 let sdkConnectTriggered = false;
@@ -1261,6 +1260,12 @@ function albumRow(a) {
 
 // Appends to whatever's already playing instead of replacing it -- for
 // queueing something up without interrupting the current track.
+function showToast(message) {
+  const toast = el('div', 'toast', message);
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 2200);
+}
+
 function queueButton(uri) {
   const btn = el('button', 'button small', '+');
   btn.title = 'Add to queue';
@@ -1273,6 +1278,9 @@ function queueButton(uri) {
     try {
       await api('/spotify-api/player/queue', {method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({uri, device_id})});
+      showToast('Added to queue');
+    } catch (err) {
+      showToast('Could not add to queue: ' + err.message);
     } finally { btn.disabled = false; }
   };
   return btn;
@@ -1331,12 +1339,13 @@ function renderSearchResults() {
   }
 }
 
-async function loadArtist(id, name) {
+async function loadArtist(id, name, refresh) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const albums = await api('/spotify-api/artists/' + id + '/albums');
+    const albums = await api('/spotify-api/artists/' + id + '/albums' + (refresh ? '?refresh=1' : ''));
     renderArtistView({id, name, albums: albums.items});
+    if (refresh) showToast('Refreshed');
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
@@ -1347,7 +1356,17 @@ function renderArtistView(artist) {
   const back = el('a', null, '← Back'); back.onclick = () => goBack();
   crumbs.appendChild(back);
   view.appendChild(crumbs);
-  view.appendChild(el('h2', null, artist.name));
+  const heading = el('div', 'row');
+  heading.style.margin = '22px 0 10px';
+  const artistTitle = el('h2', null, artist.name);
+  artistTitle.style.margin = '0';
+  heading.appendChild(artistTitle);
+  const refreshBtn = iconButton('<svg width="14" height="14" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    'Update cache', 'icon-btn small');
+  refreshBtn.style.width = '26px'; refreshBtn.style.height = '26px';
+  refreshBtn.onclick = () => loadArtist(artist.id, artist.name, true);
+  heading.appendChild(refreshBtn);
+  view.appendChild(heading);
 
   // Hidden for now: building a dedup list calls fetch_artist_albums *and*
   // fetch_album_tracks for every single album, which is by far the heaviest
@@ -1434,13 +1453,14 @@ function renderDedupView(artist, items) {
   view.appendChild(list);
 }
 
-async function loadAlbum(id, queueCtx) {
+async function loadAlbum(id, queueCtx, refresh) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const album = await api('/spotify-api/albums/' + id);
+    const album = await api('/spotify-api/albums/' + id + (refresh ? '?refresh=1' : ''));
     state.albumQueue = queueCtx || null;
     await renderAlbumView(album);
+    if (refresh) showToast('Refreshed');
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
@@ -1489,6 +1509,12 @@ async function renderAlbumView(album) {
     }
   };
   actions.appendChild(favBtn);
+
+  const refreshBtn = iconButton('<svg width="14" height="14" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    'Update cache', 'icon-btn small');
+  refreshBtn.style.width = '32px'; refreshBtn.style.height = '32px';
+  refreshBtn.onclick = () => loadAlbum(album.id, state.albumQueue, true);
+  actions.appendChild(refreshBtn);
   view.appendChild(actions);
 
   const list = el('ul', 'list');
@@ -1831,7 +1857,7 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_next_in_artist(match.group(1)); return
         match = ALBUM_RE.match(path)
         if match:
-            self.handle_album(match.group(1)); return
+            self.handle_album(match.group(1), query); return
         match = FAVORITE_RE.match(path)
         if match:
             self.send_json(200, {"favorited": is_favorite(match.group(1))}); return
@@ -1942,7 +1968,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_artist_albums(self, artist_id, query):
         groups = query.get("groups", ["album,single,compilation"])[0]
-        albums = fetch_artist_albums(artist_id, groups)
+        force = query.get("refresh", ["0"])[0] in ("1", "true")
+        albums = fetch_artist_albums(artist_id, groups, force=force)
         out = []
         for album in albums:
             images = album.get("images") or []
@@ -1956,16 +1983,17 @@ class Handler(BaseHTTPRequestHandler):
         groups = query.get("groups", ["album,single,compilation"])[0]
         self.send_json(200, {"items": build_dedup_tracks(artist_id, groups)})
 
-    def handle_album(self, album_id):
+    def handle_album(self, album_id, query=None):
+        force = bool(query) and query.get("refresh", ["0"])[0] in ("1", "true")
         # Favorited albums are a small, stable set -- serve them straight from
         # sqlite with zero Spotify calls once cached, instead of re-fetching
         # metadata + tracks (paginated at this app's limit=10) every visit.
-        cached = get_favorite_album_detail(album_id)
+        cached = None if force else get_favorite_album_detail(album_id)
         if cached:
             self.send_json(200, cached)
             return
-        album = fetch_album_meta(album_id)
-        tracks = fetch_album_tracks(album_id)
+        album = fetch_album_meta(album_id, force=force)
+        tracks = fetch_album_tracks(album_id, force=force)
         images = album.get("images") or []
         result = {
             "id": album["id"], "name": album["name"], "album_type": album.get("album_type", ""),
