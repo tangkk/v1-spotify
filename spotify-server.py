@@ -39,6 +39,10 @@ Routes:
   POST /spotify-api/player/previous   {"device_id"}
   GET  /spotify-api/view-state        -> {"view": {...}|null, "updated_at", "updated_by"}
   PUT  /spotify-api/view-state        {"view": {...}, "client_id": "..."} -- cross-device "what's on screen" sync
+  GET    /spotify-api/favorites            -> {"items": [{id, name, artists, image, added_at}]}
+  GET    /spotify-api/favorites/<album_id> -> {"favorited": bool}
+  PUT    /spotify-api/favorites/<album_id> {"name", "artists", "image"} -- add/update a favorite album
+  DELETE /spotify-api/favorites/<album_id> -- remove a favorite album
 """
 import base64
 import json
@@ -76,6 +80,7 @@ SEARCH_CACHE_TTL = 60
 ARTIST_ALBUMS_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/albums$")
 ARTIST_DEDUP_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/dedup-tracks$")
 ALBUM_RE = re.compile(r"^/spotify-api/albums/([A-Za-z0-9]{10,40})$")
+FAVORITE_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})$")
 ALBUM_TYPE_RANK = {"album": 3, "single": 2, "compilation": 1, "appears_on": 0}
 
 _search_cache = {}
@@ -115,6 +120,13 @@ def db():
         product TEXT,
         linked_at INTEGER NOT NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS favorite_albums (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        artists TEXT NOT NULL,
+        image TEXT,
+        added_at INTEGER NOT NULL
+    )""")
     return conn
 
 
@@ -146,6 +158,35 @@ def clear_account():
     with _token_lock:
         _token_cache["access_token"] = None
         _token_cache["expires_at"] = 0.0
+
+
+def add_favorite(album_id, name, artists, image):
+    with db() as conn:
+        conn.execute("""INSERT INTO favorite_albums(id, name, artists, image, added_at)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON CONFLICT(id) DO UPDATE SET
+                             name=excluded.name, artists=excluded.artists, image=excluded.image""",
+                     (album_id, name, json.dumps(artists or []), image, int(time.time())))
+        conn.commit()
+
+
+def remove_favorite(album_id):
+    with db() as conn:
+        conn.execute("DELETE FROM favorite_albums WHERE id=?", (album_id,))
+        conn.commit()
+
+
+def list_favorites():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, artists, image, added_at FROM favorite_albums ORDER BY added_at DESC").fetchall()
+    return [{"id": r[0], "name": r[1], "artists": json.loads(r[2]), "image": r[3], "added_at": r[4]} for r in rows]
+
+
+def is_favorite(album_id):
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM favorite_albums WHERE id=?", (album_id,)).fetchone()
+    return row is not None
 
 
 # ------------------------------------------------------------- spotify io --
@@ -424,7 +465,7 @@ SPOTIFY_APPLE_ICON = base64.b64decode(
 )
 
 SPOTIFY_PAGE = r"""<!doctype html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
@@ -435,16 +476,17 @@ SPOTIFY_PAGE = r"""<!doctype html>
   * { box-sizing:border-box; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
          touch-action:manipulation; background:#fff; color:#000; min-height:100vh;
-         padding:32px 20px 96px; }
-  header { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px; }
+         padding:20px 20px 96px; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; gap:12px; }
   h1 { font-size:20px; margin:0; }
-  .nav { font-size:13px; }
-  .nav a { color:#666; text-decoration:underline; margin-left:12px; }
-  .hint { color:#666; font-size:13px; line-height:1.5; margin:0 0 20px; }
+  .header-right { display:flex; align-items:center; gap:10px; }
+  #authStatus { font-size:12px; color:#666; text-align:right; }
+  #authStatus a { color:#666; text-decoration:underline; cursor:pointer; margin-left:8px; }
+  .hint { color:#666; font-size:13px; line-height:1.5; margin:0 0 18px; }
   .panel { border:1px solid #000; padding:14px 16px; margin-bottom:20px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .button { padding:8px 16px; border:1px solid #000; background:#fff; color:#000;
-            font:inherit; font-size:14px; cursor:pointer; }
+            font:inherit; font-size:14px; cursor:pointer; -webkit-appearance:none; appearance:none; }
   .button:hover { background:#f0f0f0; }
   .button.primary { background:#000; color:#fff; }
   .button.primary:hover { background:#222; }
@@ -452,9 +494,13 @@ SPOTIFY_PAGE = r"""<!doctype html>
   .button.danger:hover { background:#c00; color:#fff; }
   .button.small { padding:4px 10px; font-size:12px; }
   .muted { color:#666; font-size:13px; }
-  select { padding:6px 8px; border:1px solid #999; background:#fff; color:#000; font:inherit; font-size:13px; }
+  .icon-btn { display:inline-flex; align-items:center; justify-content:center; width:38px; height:38px;
+              border:1px solid #000; background:#fff; color:#000; cursor:pointer; padding:0; flex:none;
+              -webkit-appearance:none; appearance:none; }
+  .icon-btn:hover { background:#f0f0f0; }
+  .icon-btn.active { background:#000; color:#fff; }
+  .icon-btn.active:hover { background:#222; }
   input[type=text] { flex:1; min-width:160px; padding:9px 10px; border:1px solid #999; font:inherit; font-size:15px; }
-  label.toggle { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:#333; cursor:pointer; }
   h2 { font-size:15px; margin:22px 0 10px; }
   ul.list { list-style:none; margin:0; padding:0; }
   ul.list li { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid #eee; }
@@ -501,17 +547,20 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <body>
 <header>
   <h1>Spotify</h1>
-  <div class="nav"><a href="https://spotify.example.com/">Media</a><a href="https://example.com/">Home</a></div>
+  <div class="header-right">
+    <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
+    <div id="authStatus"></div>
+  </div>
 </header>
-<p class="hint">按艺人/专辑搜索。音乐和封面直接从 Spotify 流到这个浏览器，V1 只负责搜索、鉴权和播放控制。</p>
+<p class="hint">Search by artist or album. Music and artwork stream directly from Spotify to this browser; V1 only handles search, auth, and playback control.</p>
 
-<div id="linkPanel" class="panel"></div>
+<div id="connectPanel" class="panel" style="display:none"></div>
 
 <div id="searchPanel" class="panel" style="display:none">
   <div class="row">
-    <input type="text" id="searchInput" placeholder="搜索艺人或专辑">
-    <button class="button primary" id="searchButton">搜索</button>
-    <label class="toggle"><input type="checkbox" id="coversToggle"> 显示封面</label>
+    <input type="text" id="searchInput" placeholder="Search artists or albums">
+    <button class="icon-btn" id="searchButton" title="Search"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="2"/><line x1="13.5" y1="13.5" x2="18" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button class="icon-btn" id="coversButton" title="Show covers"><svg width="18" height="18" viewBox="0 0 20 20"><rect x="2" y="4" width="16" height="12" rx="1" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="9" r="1.5" fill="currentColor"/><path d="M3 15l4.5-4.5 3 3 3-4 3.5 5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
   </div>
   <div id="searchError" class="error"></div>
 </div>
@@ -556,6 +605,7 @@ const state = {
   devices: [],
   player: null,
   clientId: getClientId(),
+  albumQueue: null, // {ids: [albumId, ...], pos: index} -- drives auto-advance to the next album
 };
 
 function api(path, opts) {
@@ -574,35 +624,59 @@ function el(tag, cls, text) {
   return n;
 }
 
+function iconButton(svg, title, cls) {
+  const btn = el('button', cls || 'icon-btn');
+  btn.title = title;
+  btn.innerHTML = svg;
+  return btn;
+}
+
 function fmtDuration(ms) {
   const s = Math.round(ms / 1000);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
+function coverImg(url, cls) {
+  const img = el('img', cls || 'cover');
+  img.dataset.src = url || '';
+  if (state.showCovers && url) { img.src = url; } else { img.style.display = 'none'; }
+  return img;
+}
+
+function applyCoversVisibility() {
+  document.querySelectorAll('img.cover, #npCover').forEach(img => {
+    const src = img.dataset.src || '';
+    if (state.showCovers && src) { img.src = src; img.style.display = ''; }
+    else { img.style.display = 'none'; }
+  });
+}
+
 // ---- link status / SDK bootstrap ----
 
-function renderLinkPanel(status) {
-  const panel = document.getElementById('linkPanel');
-  panel.innerHTML = '';
+function renderAuthArea(status) {
+  const connectPanel = document.getElementById('connectPanel');
+  const authStatus = document.getElementById('authStatus');
+  connectPanel.style.display = 'none';
+  authStatus.textContent = '';
   if (!status.linked) {
-    panel.appendChild(el('div', 'muted', '还没有连接 Spotify 账号。'));
+    connectPanel.style.display = '';
+    connectPanel.innerHTML = '';
+    connectPanel.appendChild(el('div', 'muted', 'Not connected to Spotify.'));
     const btn = el('button', 'button primary', 'Connect Spotify');
     btn.style.marginTop = '10px';
     btn.onclick = () => { window.location.href = '/spotify-api/login'; };
-    panel.appendChild(btn);
+    connectPanel.appendChild(btn);
     return;
   }
-  const row = el('div', 'row');
-  row.appendChild(el('div', 'muted', 'Connected as ' + (status.display_name || 'Spotify user') +
-    (status.premium ? '' : '（非 Premium 账号，播放控制会失败）')));
-  const disconnect = el('button', 'button danger small', 'Disconnect');
+  authStatus.textContent = 'Connected as ' + (status.display_name || 'Spotify user') +
+    (status.premium ? '' : ' (not Premium — playback will fail)');
+  const disconnect = el('a', null, 'Disconnect');
   disconnect.onclick = async () => {
-    if (!confirm('断开 Spotify 连接？')) return;
+    if (!confirm('Disconnect Spotify?')) return;
     await api('/spotify-api/logout', {method: 'POST'});
     location.reload();
   };
-  row.appendChild(disconnect);
-  panel.appendChild(row);
+  authStatus.appendChild(disconnect);
 }
 
 let sdkConnectTriggered = false;
@@ -629,7 +703,7 @@ function initSDK() {
     player.addListener('not_ready', () => { state.deviceId = null; });
     player.addListener('initialization_error', ({message}) => console.error('spotify init error', message));
     player.addListener('authentication_error', ({message}) => console.error('spotify auth error', message));
-    player.addListener('account_error', ({message}) => console.error('spotify account error (需要 Premium)', message));
+    player.addListener('account_error', ({message}) => console.error('spotify account error (Premium required)', message));
   };
 }
 
@@ -691,11 +765,14 @@ async function ensureDevice() {
   }
   await refreshDevices();
   const active = state.devices.find(d => d.is_active) || state.devices[0];
-  if (!active) { alert('没有可用的 Spotify 设备，请重试一次，或在手机/电脑上打开 Spotify。'); return null; }
+  if (!active) { alert('No available Spotify device. Please try again, or open Spotify on your phone/computer.'); return null; }
   return active.id;
 }
 
 async function playUris(uris, contextUri, offset) {
+  // A raw uris-based queue (dedup list, "Play all") isn't part of any
+  // album-to-album auto-advance context, so starting one clears it.
+  if (uris) state.albumQueue = null;
   await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
@@ -706,51 +783,62 @@ async function playUris(uris, contextUri, offset) {
   pollNowPlaying();
 }
 
-// ---- search / browse ----
+// ---- navigation ----
+// A small back-stack of view descriptors ({type, ...ids}) drives both the
+// in-app Back button and cross-device sync: whichever device navigates writes
+// its descriptor to the server, every other device polling it re-fetches and
+// renders the same thing through this same renderDescriptor() function.
 
-document.getElementById('coversToggle').checked = state.showCovers;
-document.getElementById('coversToggle').onchange = e => {
-  state.showCovers = e.target.checked;
-  localStorage.setItem('spotify_show_covers', state.showCovers ? '1' : '0');
-  rerenderCurrentView();
-};
+let navStack = [];
+let currentDescriptor = {type: 'home'};
 
-let lastView = {type: 'search'};
-
-function rerenderCurrentView() {
-  if (lastView.type === 'artist') renderArtistView(lastView.artist);
-  else if (lastView.type === 'album') renderAlbumView(lastView.album);
-  else if (lastView.type === 'searchResults') renderSearchResults(lastView.artists, lastView.albums);
+async function renderDescriptor(d) {
+  if (!d || d.type === 'home') { document.getElementById('view').innerHTML = ''; return; }
+  if (d.type === 'search') { document.getElementById('searchInput').value = d.query || ''; await runSearch(d.query); return; }
+  if (d.type === 'artist') { await loadArtist(d.id, d.name); return; }
+  if (d.type === 'album') { await loadAlbum(d.id, d.queueCtx); return; }
+  if (d.type === 'dedup') { await loadDedup(d.id, d.name); return; }
+  if (d.type === 'favorites') { await loadFavorites(); return; }
 }
-
-function coverImg(url, cls) {
-  const img = el('img', cls || 'cover');
-  img.style.display = state.showCovers && url ? '' : 'none';
-  if (url) img.src = url;
-  return img;
-}
-
-// ---- cross-device view sync ----
-// Every device sharing this Spotify link polls a tiny server-side pointer for
-// "what is currently on screen"; whichever device navigates writes it, the
-// others pick it up on their next poll and re-fetch+render the same view
-// themselves (only a {type, id/query} pointer is shared, never rendered HTML
-// or search result payloads, so it stays cheap and always up to date).
-
-let lastAppliedViewAt = 0;
 
 function pushViewState(view) {
   api('/spotify-api/view-state', {method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({view, client_id: state.clientId})}).catch(() => {});
 }
 
+// Forward navigation: remember where we came from, switch, tell other devices.
+async function goTo(descriptor) {
+  navStack.push(currentDescriptor);
+  currentDescriptor = descriptor;
+  await renderDescriptor(descriptor);
+  pushViewState(descriptor);
+}
+
+// Back: pop one level (defaults to home if the stack is empty).
+async function goBack() {
+  const prev = navStack.pop() || {type: 'home'};
+  currentDescriptor = prev;
+  await renderDescriptor(prev);
+  pushViewState(prev);
+}
+
+// Replace the current view without pushing a new back-stack level (used by
+// album-to-album auto-advance, which shouldn't pile up Back history).
+async function replaceCurrent(descriptor) {
+  currentDescriptor = descriptor;
+  await renderDescriptor(descriptor);
+  pushViewState(descriptor);
+}
+
+let lastAppliedViewAt = 0;
+
+// Someone else navigated; mirror it locally. Our own Back history doesn't
+// carry over since we don't know their navigation path, which is an
+// acceptable tradeoff -- Back from here just goes Home.
 async function applyRemoteView(view) {
-  if (!view) { lastView = {type: 'search'}; document.getElementById('view').innerHTML = ''; return; }
-  if (view.type === 'home') { lastView = {type: 'search'}; document.getElementById('view').innerHTML = ''; }
-  else if (view.type === 'search') { document.getElementById('searchInput').value = view.query || ''; await doSearch(false); }
-  else if (view.type === 'artist') await openArtist(view.id, view.name, false);
-  else if (view.type === 'album') await openAlbum(view.id, false);
-  else if (view.type === 'dedup') await openDedup({id: view.id, name: view.name}, false);
+  navStack = [];
+  currentDescriptor = view || {type: 'home'};
+  await renderDescriptor(currentDescriptor);
 }
 
 async function pollViewState() {
@@ -766,23 +854,73 @@ async function pollViewState() {
 }
 setInterval(pollViewState, 3000);
 
-document.getElementById('searchButton').onclick = () => doSearch();
-document.getElementById('searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+// ---- favorites ----
 
-async function doSearch(push) {
+document.getElementById('favoritesButton').onclick = () => goTo({type: 'favorites'});
+
+async function loadFavorites() {
+  const view = document.getElementById('view');
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const {items} = await api('/spotify-api/favorites');
+    renderFavoritesView(items);
+  } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
+}
+
+function renderFavoritesView(items) {
+  const view = document.getElementById('view');
+  view.innerHTML = '';
+  const crumbs = el('div', 'crumbs');
+  const back = el('a', null, '← Back'); back.onclick = () => goBack();
+  crumbs.appendChild(back);
+  view.appendChild(crumbs);
+  view.appendChild(el('h2', null, 'Favorite Albums'));
+  const list = el('ul', 'list');
+  if (!items.length) list.appendChild(el('li', 'empty', 'No favorites yet'));
+  for (const a of items) {
+    const li = el('li');
+    li.appendChild(coverImg(a.image));
+    const meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', a.name));
+    meta.appendChild(el('div', 'sub', (a.artists || []).join(', ')));
+    meta.onclick = () => goTo({type: 'album', id: a.id});
+    li.appendChild(meta);
+    list.appendChild(li);
+  }
+  view.appendChild(list);
+}
+
+// ---- search / browse ----
+
+document.getElementById('coversButton').classList.toggle('active', state.showCovers);
+document.getElementById('coversButton').onclick = () => {
+  state.showCovers = !state.showCovers;
+  localStorage.setItem('spotify_show_covers', state.showCovers ? '1' : '0');
+  document.getElementById('coversButton').classList.toggle('active', state.showCovers);
+  applyCoversVisibility();
+};
+
+document.getElementById('searchButton').onclick = () => {
   const q = document.getElementById('searchInput').value.trim();
+  if (q) goTo({type: 'search', query: q});
+};
+document.getElementById('searchInput').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim();
+  if (q) goTo({type: 'search', query: q});
+});
+
+async function runSearch(query) {
   const err = document.getElementById('searchError');
   err.textContent = '';
-  if (!q) return;
+  if (!query) return;
   try {
     const [artists, albums] = await Promise.all([
-      api('/spotify-api/search/artists?q=' + encodeURIComponent(q)),
-      api('/spotify-api/search/albums?q=' + encodeURIComponent(q)),
+      api('/spotify-api/search/artists?q=' + encodeURIComponent(query)),
+      api('/spotify-api/search/albums?q=' + encodeURIComponent(query)),
     ]);
-    lastView = {type: 'searchResults', artists: artists.items, albums: albums.items};
     renderSearchResults(artists.items, albums.items);
-    if (push !== false) pushViewState({type: 'search', query: q});
-  } catch (e) { err.textContent = '搜索失败：' + e.message; }
+  } catch (e) { err.textContent = 'Search failed: ' + e.message; }
 }
 
 function renderSearchResults(artists, albums) {
@@ -799,7 +937,7 @@ function renderSearchResults(artists, albums) {
     const meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', a.name));
     meta.appendChild(el('div', 'sub', (a.genres || []).slice(0, 3).join(', ') || 'Artist'));
-    meta.onclick = () => openArtist(a.id, a.name);
+    meta.onclick = () => goTo({type: 'artist', id: a.id, name: a.name});
     li.appendChild(meta);
     artistList.appendChild(li);
   }
@@ -815,7 +953,7 @@ function renderSearchResults(artists, albums) {
     const meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', a.name));
     meta.appendChild(el('div', 'sub', (a.artists || []).join(', ') + ' · ' + (a.release_date || '').slice(0, 4)));
-    meta.onclick = () => openAlbum(a.id);
+    meta.onclick = () => goTo({type: 'album', id: a.id});
     li.appendChild(meta);
     albumList.appendChild(li);
   }
@@ -826,14 +964,12 @@ function renderSearchResults(artists, albums) {
   view.appendChild(cols);
 }
 
-async function openArtist(id, name, push) {
+async function loadArtist(id, name) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const albums = await api('/spotify-api/artists/' + id + '/albums');
-    lastView = {type: 'artist', artist: {id, name, albums: albums.items}};
-    renderArtistView(lastView.artist);
-    if (push !== false) pushViewState({type: 'artist', id, name});
+    renderArtistView({id, name, albums: albums.items});
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
@@ -841,13 +977,13 @@ function renderArtistView(artist) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const crumbs = el('div', 'crumbs');
-  const back = el('a', null, '← Search'); back.onclick = () => { lastView = {type: 'search'}; view.innerHTML = ''; pushViewState({type: 'home'}); };
+  const back = el('a', null, '← Back'); back.onclick = () => goBack();
   crumbs.appendChild(back);
   view.appendChild(crumbs);
   view.appendChild(el('h2', null, artist.name));
 
   const dedupBtn = el('button', 'button small', 'Build deduplicated track list');
-  dedupBtn.onclick = () => openDedup(artist);
+  dedupBtn.onclick = () => goTo({type: 'dedup', id: artist.id, name: artist.name});
   view.appendChild(dedupBtn);
 
   const groups = {album: [], single: [], compilation: [], appears_on: []};
@@ -857,84 +993,89 @@ function renderArtistView(artist) {
     if (!items.length) continue;
     view.appendChild(el('h2', null, label));
     const list = el('ul', 'list');
-    for (const a of items) {
+    // Playing any album in this group sets up auto-advance to the next one in
+    // the same group (Albums -> next studio album, etc; groups don't mix).
+    const ids = items.map(a => a.id);
+    items.forEach((a, i) => {
       const li = el('li');
       li.appendChild(coverImg(a.image));
       const meta = el('div', 'meta');
       meta.appendChild(el('div', 'title', a.name));
       meta.appendChild(el('div', 'sub', (a.release_date || '').slice(0, 4) + ' · ' + a.total_tracks + ' tracks'));
-      meta.onclick = () => openAlbum(a.id);
+      meta.onclick = () => goTo({type: 'album', id: a.id, queueCtx: {ids, pos: i}});
       li.appendChild(meta);
       list.appendChild(li);
-    }
+    });
     view.appendChild(list);
   }
 }
 
-async function openDedup(artist, push) {
+async function loadDedup(id, name) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Building deduplicated list…</div>';
   try {
-    const {items} = await api('/spotify-api/artists/' + artist.id + '/dedup-tracks');
-    view.innerHTML = '';
-    const crumbs = el('div', 'crumbs');
-    const back = el('a', null, '← ' + artist.name);
-    back.onclick = () => { renderArtistView(artist); pushViewState({type: 'artist', id: artist.id, name: artist.name}); };
-    crumbs.appendChild(back);
-    view.appendChild(crumbs);
-    view.appendChild(el('h2', null, artist.name + ' · Deduplicated (' + items.length + ' songs)'));
-    if (push !== false) pushViewState({type: 'dedup', id: artist.id, name: artist.name});
-    const playAll = el('button', 'button primary small', 'Play all');
-    playAll.onclick = () => playUris(items.slice(0, 50).map(t => t.uri));
-    view.appendChild(playAll);
-    const list = el('ul', 'list');
-    items.forEach((t, i) => {
-      // Clicking a track queues it plus the rest of this (already-capped)
-      // deduplicated list, so playback continues track-to-track instead of
-      // stopping after the one song -- same continuation behavior as "Play all".
-      const queueFrom = idx => items.slice(idx, idx + 50).map(x => x.uri);
-      const li = el('li');
-      li.appendChild(coverImg(t.image));
-      const meta = el('div', 'meta');
-      meta.appendChild(el('div', 'title', t.name));
-      const sub = el('div', 'sub', t.album_name + ' · ' + (t.release_date || '').slice(0, 4) + ' · ' + fmtDuration(t.duration_ms));
-      if (t.variant_count > 1) sub.appendChild(el('span', 'badge', t.variant_count + ' versions'));
-      meta.appendChild(sub);
-      meta.onclick = () => playUris(queueFrom(i));
-      li.appendChild(meta);
-      const playBtn = el('button', 'button small', '▶'); playBtn.onclick = () => playUris(queueFrom(i));
-      li.appendChild(playBtn);
-      list.appendChild(li);
-      if (t.variant_count > 1) {
-        const variants = el('div', 'variants');
-        for (const v of t.variants) {
-          const row = el('div', null, v.album_name + ' (' + v.album_type + ', ' + (v.release_date || '').slice(0, 4) + ')');
-          row.onclick = () => playUris([v.uri, ...queueFrom(i + 1)]);
-          variants.appendChild(row);
-        }
-        list.appendChild(variants);
-      }
-    });
-    view.appendChild(list);
+    const {items} = await api('/spotify-api/artists/' + id + '/dedup-tracks');
+    renderDedupView({id, name}, items);
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
-async function openAlbum(id, push) {
+function renderDedupView(artist, items) {
+  const view = document.getElementById('view');
+  view.innerHTML = '';
+  const crumbs = el('div', 'crumbs');
+  const back = el('a', null, '← Back'); back.onclick = () => goBack();
+  crumbs.appendChild(back);
+  view.appendChild(crumbs);
+  view.appendChild(el('h2', null, artist.name + ' · Deduplicated (' + items.length + ' songs)'));
+  const playAll = el('button', 'button primary small', 'Play all');
+  playAll.onclick = () => playUris(items.slice(0, 50).map(t => t.uri));
+  view.appendChild(playAll);
+  const list = el('ul', 'list');
+  items.forEach((t, i) => {
+    // Clicking a track queues it plus the rest of this (already-capped)
+    // deduplicated list, so playback continues track-to-track instead of
+    // stopping after the one song -- same continuation behavior as "Play all".
+    const queueFrom = idx => items.slice(idx, idx + 50).map(x => x.uri);
+    const li = el('li');
+    li.appendChild(coverImg(t.image));
+    const meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', t.name));
+    const sub = el('div', 'sub', t.album_name + ' · ' + (t.release_date || '').slice(0, 4) + ' · ' + fmtDuration(t.duration_ms));
+    if (t.variant_count > 1) sub.appendChild(el('span', 'badge', t.variant_count + ' versions'));
+    meta.appendChild(sub);
+    meta.onclick = () => playUris(queueFrom(i));
+    li.appendChild(meta);
+    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = () => playUris(queueFrom(i));
+    li.appendChild(playBtn);
+    list.appendChild(li);
+    if (t.variant_count > 1) {
+      const variants = el('div', 'variants');
+      for (const v of t.variants) {
+        const row = el('div', null, v.album_name + ' (' + v.album_type + ', ' + (v.release_date || '').slice(0, 4) + ')');
+        row.onclick = () => playUris([v.uri, ...queueFrom(i + 1)]);
+        variants.appendChild(row);
+      }
+      list.appendChild(variants);
+    }
+  });
+  view.appendChild(list);
+}
+
+async function loadAlbum(id, queueCtx) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const album = await api('/spotify-api/albums/' + id);
-    lastView = {type: 'album', album};
-    renderAlbumView(album);
-    if (push !== false) pushViewState({type: 'album', id});
+    state.albumQueue = queueCtx || null;
+    await renderAlbumView(album);
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
-function renderAlbumView(album) {
+async function renderAlbumView(album) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const crumbs = el('div', 'crumbs');
-  const back = el('a', null, '← Search'); back.onclick = () => { lastView = {type: 'search'}; view.innerHTML = ''; pushViewState({type: 'home'}); };
+  const back = el('a', null, '← Back'); back.onclick = () => goBack();
   crumbs.appendChild(back);
   view.appendChild(crumbs);
 
@@ -946,10 +1087,33 @@ function renderAlbumView(album) {
   header.appendChild(meta);
   view.appendChild(header);
 
+  const actions = el('div', 'row');
+  actions.style.marginTop = '10px';
   const playAlbumBtn = el('button', 'button primary small', 'Play album');
-  playAlbumBtn.style.marginTop = '10px';
   playAlbumBtn.onclick = () => playUris(null, 'spotify:album:' + album.id);
-  view.appendChild(playAlbumBtn);
+  actions.appendChild(playAlbumBtn);
+
+  const favBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>', 'Add to favorites', 'icon-btn small');
+  favBtn.style.width = '32px'; favBtn.style.height = '32px';
+  let favorited = false;
+  try { const st = await api('/spotify-api/favorites/' + album.id); favorited = !!st.favorited; } catch (e) {}
+  const syncFavBtn = () => {
+    favBtn.classList.toggle('active', favorited);
+    favBtn.title = favorited ? 'Remove from favorites' : 'Add to favorites';
+  };
+  syncFavBtn();
+  favBtn.onclick = async () => {
+    favorited = !favorited;
+    syncFavBtn();
+    if (favorited) {
+      await api('/spotify-api/favorites/' + album.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: album.name, artists: album.artists, image: album.image})});
+    } else {
+      await api('/spotify-api/favorites/' + album.id, {method: 'DELETE'});
+    }
+  };
+  actions.appendChild(favBtn);
+  view.appendChild(actions);
 
   const list = el('ul', 'list');
   for (const t of album.tracks) {
@@ -958,16 +1122,29 @@ function renderAlbumView(album) {
     // same continuation behavior as "Play album".
     const playFromHere = () => playUris(null, 'spotify:album:' + album.id, {uri: t.uri});
     const li = el('li');
-    const meta = el('div', 'meta');
-    meta.appendChild(el('div', 'title', t.track_number + '. ' + t.name));
-    meta.appendChild(el('div', 'sub', (t.artists || []).join(', ') + ' · ' + fmtDuration(t.duration_ms)));
-    meta.onclick = playFromHere;
-    li.appendChild(meta);
+    const meta2 = el('div', 'meta');
+    meta2.appendChild(el('div', 'title', t.track_number + '. ' + t.name));
+    meta2.appendChild(el('div', 'sub', (t.artists || []).join(', ') + ' · ' + fmtDuration(t.duration_ms)));
+    meta2.onclick = playFromHere;
+    li.appendChild(meta2);
     const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
     li.appendChild(playBtn);
     list.appendChild(li);
   }
   view.appendChild(list);
+}
+
+// Album finished with nothing next queued by Spotify itself -- if it was
+// played from an artist's album list, auto-advance to the next album in that
+// same list, replacing the current view without adding Back history.
+async function advanceAlbumQueue() {
+  const queue = state.albumQueue;
+  if (!queue) return;
+  const nextPos = queue.pos + 1;
+  if (nextPos >= queue.ids.length) { state.albumQueue = null; return; }
+  const nextId = queue.ids[nextPos];
+  await replaceCurrent({type: 'album', id: nextId, queueCtx: {ids: queue.ids, pos: nextPos}});
+  await playUris(null, 'spotify:album:' + nextId);
 }
 
 // ---- now playing / transport ----
@@ -1003,22 +1180,36 @@ document.getElementById('npVolume').onchange = async e => {
 
 // npState holds the last poll's snapshot; a fast local timer interpolates the
 // visible position between 5s polls so the progress bar moves smoothly
-// instead of jumping once every 5 seconds.
+// instead of jumping once every 5 seconds. wasPlayingTick tracks the previous
+// tick's is_playing so we can edge-detect "playback just stopped" once, to
+// drive album-to-album auto-advance without re-triggering every poll.
 let npState = null;
+let wasPlayingTick = false;
 
 async function pollNowPlaying() {
   try {
     const np = await api('/spotify-api/player/now-playing');
     const bar = document.getElementById('nowplaying');
-    if (!np.track) { bar.style.display = 'none'; npState = null; return; }
+    if (!np.track) {
+      bar.style.display = 'none';
+      const justStopped = wasPlayingTick;
+      wasPlayingTick = false;
+      npState = null;
+      if (justStopped) await advanceAlbumQueue();
+      return;
+    }
     bar.style.display = 'flex';
     const cover = document.getElementById('npCover');
-    cover.style.display = state.showCovers && np.track.image ? '' : 'none';
-    if (np.track.image) cover.src = np.track.image;
+    cover.dataset.src = np.track.image || '';
+    if (state.showCovers && np.track.image) { cover.src = np.track.image; cover.style.display = ''; } else { cover.style.display = 'none'; }
     document.getElementById('npTitle').textContent = np.track.name;
     document.getElementById('npSub').textContent = np.track.artists.join(', ') + ' · ' + (np.device || '');
     document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
+    const nearEnd = np.track.duration_ms && (np.progress_ms >= np.track.duration_ms - 2000);
+    const justStopped = wasPlayingTick && !np.playing;
+    wasPlayingTick = np.playing;
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
+    if (justStopped && nearEnd) await advanceAlbumQueue();
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
@@ -1067,7 +1258,7 @@ setInterval(renderProgress, 250);
   try {
     const status = await api('/spotify-api/status');
     state.linked = status.linked;
-    renderLinkPanel(status);
+    renderAuthArea(status);
     if (status.linked) {
       document.getElementById('searchPanel').style.display = '';
       pollNowPlaying();
@@ -1075,7 +1266,8 @@ setInterval(renderProgress, 250);
       if (remote.view) { lastAppliedViewAt = remote.updated_at || 0; await applyRemoteView(remote.view); }
     }
   } catch (e) {
-    document.getElementById('linkPanel').textContent = '状态加载失败：' + e.message;
+    document.getElementById('connectPanel').style.display = '';
+    document.getElementById('connectPanel').textContent = 'Failed to load status: ' + e.message;
   }
 })();
 </script>
@@ -1197,6 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_now_playing(); return
         if path == "/spotify-api/view-state":
             self.send_json(200, get_view_state()); return
+        if path == "/spotify-api/favorites":
+            self.send_json(200, {"items": list_favorites()}); return
         match = ARTIST_ALBUMS_RE.match(path)
         if match:
             self.handle_artist_albums(match.group(1), query); return
@@ -1206,6 +1400,9 @@ class Handler(BaseHTTPRequestHandler):
         match = ALBUM_RE.match(path)
         if match:
             self.handle_album(match.group(1)); return
+        match = FAVORITE_RE.match(path)
+        if match:
+            self.send_json(200, {"favorited": is_favorite(match.group(1))}); return
         self.send_json(404, {"error": "not_found"})
 
     def handle_status(self):
@@ -1403,6 +1600,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/spotify-api/view-state":
             body = self.read_json_body()
             set_view_state(body.get("view"), body.get("client_id"))
+            self.send_json(200, {"ok": True}); return
+        match = FAVORITE_RE.match(path)
+        if match:
+            body = self.read_json_body()
+            add_favorite(match.group(1), body.get("name", ""), body.get("artists"), body.get("image"))
+            self.send_json(200, {"ok": True}); return
+        self.send_json(404, {"error": "not_found"})
+
+    # -- DELETE --
+
+    def do_DELETE(self):
+        self.safe(self._do_DELETE)
+
+    def _do_DELETE(self):
+        path = urlparse(self.path).path
+        match = FAVORITE_RE.match(path)
+        if match:
+            remove_favorite(match.group(1))
             self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
