@@ -26,7 +26,7 @@ Routes:
   GET  /spotify-api/search/artists?q=
   GET  /spotify-api/search/albums?q=
   GET  /spotify-api/artists/<id>/albums
-  GET  /spotify-api/artists/<id>/dedup-tracks?prefer=popularity|original
+  GET  /spotify-api/artists/<id>/dedup-tracks
   GET  /spotify-api/albums/<id>
   GET  /spotify-api/devices
   GET  /spotify-api/player/now-playing
@@ -64,6 +64,11 @@ ACCOUNTS_TOKEN_URL = "https://accounts.spotify.com/api/token"
 AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 API_BASE = "https://api.spotify.com/v1"
 
+# This app/account is capped by Spotify at limit<=10 on every paginated
+# endpoint (search, artist albums, album tracks) -- the documented max of 50
+# returns {"error":{"status":400,"message":"Invalid limit"}} above 10, verified
+# empirically against the live API. Keep every page/limit param at or below this.
+SPOTIFY_PAGE_LIMIT = 10
 SEARCH_CACHE_TTL = 60
 ARTIST_ALBUMS_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/albums$")
 ARTIST_DEDUP_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/dedup-tracks$")
@@ -233,7 +238,7 @@ def fetch_artist_albums(artist_id, groups, limit_total=200):
     offset = 0
     while len(albums) < limit_total:
         page = spotify_api("GET", f"/artists/{artist_id}/albums",
-                            params={"include_groups": groups, "limit": 50, "offset": offset})
+                            params={"include_groups": groups, "limit": SPOTIFY_PAGE_LIMIT, "offset": offset})
         items = page.get("items", [])
         if not items:
             break
@@ -245,7 +250,7 @@ def fetch_artist_albums(artist_id, groups, limit_total=200):
             albums.append(album)
         if not page.get("next"):
             break
-        offset += 50
+        offset += SPOTIFY_PAGE_LIMIT
     return albums[:limit_total]
 
 
@@ -253,14 +258,15 @@ def fetch_album_tracks(album_id, limit_total=300):
     tracks = []
     offset = 0
     while len(tracks) < limit_total:
-        page = spotify_api("GET", f"/albums/{album_id}/tracks", params={"limit": 50, "offset": offset})
+        page = spotify_api("GET", f"/albums/{album_id}/tracks",
+                            params={"limit": SPOTIFY_PAGE_LIMIT, "offset": offset})
         items = page.get("items", [])
         if not items:
             break
         tracks.extend(items)
         if not page.get("next"):
             break
-        offset += 50
+        offset += SPOTIFY_PAGE_LIMIT
     return tracks[:limit_total]
 
 
@@ -300,7 +306,13 @@ def _date_ordinal(date_str):
         return 99990101
 
 
-def build_dedup_tracks(artist_id, groups, prefer):
+def build_dedup_tracks(artist_id, groups):
+    # Spotify no longer exposes track `popularity` to Development Mode apps
+    # (missing even from the singular /v1/tracks/{id} response, and the batch
+    # /v1/tracks?ids=... endpoint is outright 403 for this app), so dedup can
+    # only rank by album_type (studio album > single > compilation > appears_on)
+    # and, within a type, the earliest release date -- i.e. prefer the original
+    # release over a later reissue/remaster/deluxe repackaging.
     albums = fetch_artist_albums(artist_id, groups)
     entries = []
     for album in albums:
@@ -318,27 +330,13 @@ def build_dedup_tracks(artist_id, groups, prefer):
                 "image": (album.get("images") or [{}])[0].get("url"),
             })
 
-    popularity = {}
-    ids = [e["id"] for e in entries]
-    for i in range(0, len(ids), 50):
-        chunk = ids[i:i + 50]
-        if not chunk:
-            continue
-        result = spotify_api("GET", "/tracks", params={"ids": ",".join(chunk)})
-        for t in result.get("tracks", []):
-            if t:
-                popularity[t["id"]] = t.get("popularity", 0)
-
     groups_map = {}
     for e in entries:
-        e["popularity"] = popularity.get(e["id"], 0)
         groups_map.setdefault(normalize_title(e["name"]), []).append(e)
 
     def score(e):
         rank = ALBUM_TYPE_RANK.get(e["album_type"], 0)
-        if prefer == "original":
-            return (rank, -_date_ordinal(e["release_date"]))
-        return (rank, e["popularity"])
+        return (rank, -_date_ordinal(e["release_date"]))
 
     out = []
     for variants in groups_map.values():
@@ -721,7 +719,7 @@ async function openDedup(artist) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Building deduplicated list…</div>';
   try {
-    const {items} = await api('/spotify-api/artists/' + artist.id + '/dedup-tracks?prefer=popularity');
+    const {items} = await api('/spotify-api/artists/' + artist.id + '/dedup-tracks');
     view.innerHTML = '';
     const crumbs = el('div', 'crumbs');
     const back = el('a', null, '← ' + artist.name); back.onclick = () => renderArtistView(artist);
@@ -1022,9 +1020,9 @@ class Handler(BaseHTTPRequestHandler):
         if not q:
             self.send_json(400, {"error": "missing_query"}); return
         try:
-            limit = min(max(int(query.get("limit", ["20"])[0]), 1), 50)
+            limit = min(max(int(query.get("limit", [str(SPOTIFY_PAGE_LIMIT)])[0]), 1), SPOTIFY_PAGE_LIMIT)
         except ValueError:
-            limit = 20
+            limit = SPOTIFY_PAGE_LIMIT
         result = cached_search(kind, q, limit)
         items = (result.get(kind + "s") or {}).get("items", [])
         out = []
@@ -1057,10 +1055,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_dedup(self, artist_id, query):
         groups = query.get("groups", ["album,single,compilation"])[0]
-        prefer = query.get("prefer", ["popularity"])[0]
-        if prefer not in ("popularity", "original"):
-            prefer = "popularity"
-        self.send_json(200, {"items": build_dedup_tracks(artist_id, groups, prefer), "prefer": prefer})
+        self.send_json(200, {"items": build_dedup_tracks(artist_id, groups)})
 
     def handle_album(self, album_id):
         album = spotify_api("GET", f"/albums/{album_id}")
