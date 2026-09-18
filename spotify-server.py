@@ -30,6 +30,7 @@ Routes:
   GET  /spotify-api/artists/<id>/dedup-tracks
   GET  /spotify-api/albums/<id>
   GET  /spotify-api/devices
+  GET  /spotify-api/recently-played
   GET  /spotify-api/player/now-playing
   PUT  /spotify-api/player/transfer   {"device_id": "...", "play": true}
   PUT  /spotify-api/player/play       {"device_id", "uris"|"context_uri", "offset", "position_ms"}
@@ -38,6 +39,7 @@ Routes:
   PUT  /spotify-api/player/seek?position_ms=&device_id=...
   POST /spotify-api/player/next       {"device_id"}
   POST /spotify-api/player/previous   {"device_id"}
+  POST /spotify-api/player/queue      {"uri", "device_id"} -- append without interrupting current playback
   GET  /spotify-api/view-state        -> {"view": {...}|null, "updated_at", "updated_by"}
   PUT  /spotify-api/view-state        {"view": {...}, "client_id": "..."} -- cross-device "what's on screen" sync
   GET    /spotify-api/favorites            -> {"items": [{id, name, artists, image, release_date, genres, added_at}]}
@@ -67,7 +69,8 @@ CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "https://spotify.example.com/spotify-api/callback")
 SCOPES = ("streaming user-read-email user-read-private "
-          "user-read-playback-state user-modify-playback-state user-read-currently-playing")
+          "user-read-playback-state user-modify-playback-state user-read-currently-playing "
+          "user-read-recently-played")
 
 ACCOUNTS_TOKEN_URL = "https://accounts.spotify.com/api/token"
 AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
@@ -549,9 +552,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
          touch-action:manipulation; background:#fff; color:#000; min-height:100vh;
          padding:20px 20px 96px; }
-  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; position:relative; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
   .logo { height:32px; width:32px; display:block; }
-  header h1 { font-size:18px; margin:0; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); }
   .header-right { display:flex; align-items:center; gap:10px; }
   #authStatus { font-size:12px; color:#666; text-align:right; }
   #authStatus a { color:#666; text-decoration:underline; cursor:pointer; margin-left:8px; }
@@ -619,13 +621,13 @@ SPOTIFY_PAGE = r"""<!doctype html>
   @media (max-width: 520px) {
     #nowplaying .track .sub { display:none; }
     #nowplaying .controls button { padding:6px 8px; font-size:11px; }
+    #searchPanel input[type=text] { flex-basis:100%; }
   }
 </style>
 </head>
 <body>
 <header>
   <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo">
-  <h1>Spotify</h1>
   <div class="header-right">
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
     <div id="authStatus"></div>
@@ -873,7 +875,7 @@ let navStack = [];
 let currentDescriptor = {type: 'home'};
 
 async function renderDescriptor(d) {
-  if (!d || d.type === 'home') { document.getElementById('view').innerHTML = ''; return; }
+  if (!d || d.type === 'home') { await loadRecentlyPlayed(); return; }
   if (d.type === 'search') { document.getElementById('searchInput').value = d.query || ''; await runSearch(d.query, d.kind || 'artist'); return; }
   if (d.type === 'artist') { await loadArtist(d.id, d.name); return; }
   if (d.type === 'album') { await loadAlbum(d.id, d.queueCtx); return; }
@@ -1128,6 +1130,25 @@ function albumRow(a) {
   return li;
 }
 
+// Appends to whatever's already playing instead of replacing it -- for
+// queueing something up without interrupting the current track.
+function queueButton(uri) {
+  const btn = el('button', 'button small', '+');
+  btn.title = 'Add to queue';
+  btn.onclick = async e => {
+    e.stopPropagation();
+    await ensureAudioUnlocked();
+    const device_id = await ensureDevice();
+    if (!device_id) return;
+    btn.disabled = true;
+    try {
+      await api('/spotify-api/player/queue', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uri, device_id})});
+    } finally { btn.disabled = false; }
+  };
+  return btn;
+}
+
 function trackRow(t) {
   // Start the track's own album context at this track, same continuation
   // behavior as every other play entry point in the app.
@@ -1141,7 +1162,27 @@ function trackRow(t) {
   li.appendChild(meta);
   const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
   li.appendChild(playBtn);
+  li.appendChild(queueButton(t.uri));
   return li;
+}
+
+async function loadRecentlyPlayed() {
+  const view = document.getElementById('view');
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const {items} = await api('/spotify-api/recently-played');
+    renderRecentlyPlayedView(items);
+  } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
+}
+
+function renderRecentlyPlayedView(items) {
+  const view = document.getElementById('view');
+  view.innerHTML = '';
+  view.appendChild(el('h2', null, 'Recently Played'));
+  const list = el('ul', 'list');
+  if (!items.length) list.appendChild(el('li', 'empty', 'Nothing played yet'));
+  for (const t of items) list.appendChild(trackRow(t));
+  view.appendChild(list);
 }
 
 function renderSearchResults() {
@@ -1335,6 +1376,7 @@ async function renderAlbumView(album) {
     li.appendChild(meta2);
     const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
     li.appendChild(playBtn);
+    li.appendChild(queueButton(t.uri));
     list.appendChild(li);
   }
   view.appendChild(list);
@@ -1620,6 +1662,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_search("track", query); return
         if path == "/spotify-api/devices":
             self.handle_devices(); return
+        if path == "/spotify-api/recently-played":
+            self.handle_recently_played(); return
         if path == "/spotify-api/player/now-playing":
             self.handle_now_playing(); return
         if path == "/spotify-api/view-state":
@@ -1791,6 +1835,22 @@ class Handler(BaseHTTPRequestHandler):
         result = spotify_api("GET", "/me/player/devices")
         self.send_json(200, {"items": result.get("devices", [])})
 
+    def handle_recently_played(self):
+        result = spotify_api("GET", "/me/player/recently-played", params={"limit": SPOTIFY_PAGE_LIMIT})
+        out = []
+        for entry in result.get("items", []):
+            track = entry.get("track") or {}
+            album = track.get("album") or {}
+            images = album.get("images") or []
+            out.append({
+                "id": track.get("id"), "uri": track.get("uri"), "name": track.get("name"),
+                "image": images[0]["url"] if images else None,
+                "artists": [a["name"] for a in track.get("artists", [])],
+                "album_id": album.get("id"), "album_name": album.get("name", ""),
+                "duration_ms": track.get("duration_ms", 0),
+            })
+        self.send_json(200, {"items": out})
+
     def handle_now_playing(self):
         result = spotify_api("GET", "/me/player")
         item = (result or {}).get("item")
@@ -1932,6 +1992,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/spotify-api/player/previous":
             body = self.read_json_body()
             spotify_api("POST", "/me/player/previous", params={"device_id": body.get("device_id")})
+            self.send_json(200, {"ok": True}); return
+        if path == "/spotify-api/player/queue":
+            body = self.read_json_body()
+            uri = body.get("uri")
+            if not uri:
+                self.send_json(400, {"error": "missing_uri"}); return
+            spotify_api("POST", "/me/player/queue", params={"uri": uri, "device_id": body.get("device_id")})
             self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
