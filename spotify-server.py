@@ -109,6 +109,34 @@ def get_view_state():
         return dict(_view_state)
 
 
+# The Web Playback SDK device IS this browser tab, so a reload always tears
+# down and recreates it -- Spotify's live /v1/me/player then briefly (or
+# permanently, if nothing resumes it) reports no active device at all. Caching
+# the last known now-playing payload here means a reload still shows the same
+# track and playhead instead of the bar just going blank; handle_now_playing
+# forces playing=False on a cached fallback since we genuinely don't know
+# whether it's still advancing.
+_last_playback_lock = threading.Lock()
+_last_playback = None
+
+
+def set_last_playback(payload):
+    global _last_playback
+    with _last_playback_lock:
+        _last_playback = payload
+
+
+def get_last_playback():
+    with _last_playback_lock:
+        return dict(_last_playback) if _last_playback else None
+
+
+def clear_last_playback():
+    global _last_playback
+    with _last_playback_lock:
+        _last_playback = None
+
+
 # ---------------------------------------------------------------- storage --
 
 def db():
@@ -159,6 +187,7 @@ def clear_account():
     with _token_lock:
         _token_cache["access_token"] = None
         _token_cache["expires_at"] = 0.0
+    clear_last_playback()
 
 
 def add_favorite(album_id, name, artists, image):
@@ -1216,11 +1245,12 @@ async function pollNowPlaying() {
     const np = await api('/spotify-api/player/now-playing');
     const bar = document.getElementById('nowplaying');
     if (!np.track) {
+      // Only true when nothing has ever played this session (no server-side
+      // cache to fall back to yet) -- once something has played, the backend
+      // always returns that last snapshot instead of an empty track.
       bar.style.display = 'none';
-      const justStopped = wasPlayingTick;
       wasPlayingTick = false;
       npState = null;
-      if (justStopped) await advanceAlbumQueue();
       return;
     }
     bar.style.display = 'flex';
@@ -1569,20 +1599,38 @@ class Handler(BaseHTTPRequestHandler):
     def handle_now_playing(self):
         result = spotify_api("GET", "/me/player")
         item = (result or {}).get("item")
-        images = (item.get("album", {}).get("images") if item else []) or []
-        device = (result or {}).get("device") or {}
-        self.send_json(200, {
-            "playing": bool((result or {}).get("is_playing")),
-            "progress_ms": (result or {}).get("progress_ms", 0),
-            "device": device.get("name"),
-            "device_id": device.get("id"),
-            "track": None if not item else {
-                "name": item.get("name"), "artists": [a["name"] for a in item.get("artists", [])],
-                "album": item.get("album", {}).get("name"), "album_id": item.get("album", {}).get("id"),
-                "duration_ms": item.get("duration_ms", 0),
-                "image": images[0]["url"] if images else None, "uri": item.get("uri"),
-            },
-        })
+        if item:
+            images = (item.get("album", {}).get("images")) or []
+            device = (result or {}).get("device") or {}
+            payload = {
+                "playing": bool((result or {}).get("is_playing")),
+                "progress_ms": (result or {}).get("progress_ms", 0),
+                "device": device.get("name"),
+                "device_id": device.get("id"),
+                "track": {
+                    "name": item.get("name"), "artists": [a["name"] for a in item.get("artists", [])],
+                    "album": item.get("album", {}).get("name"), "album_id": item.get("album", {}).get("id"),
+                    "duration_ms": item.get("duration_ms", 0),
+                    "image": images[0]["url"] if images else None, "uri": item.get("uri"),
+                },
+                "live": True,
+            }
+            set_last_playback(payload)
+            self.send_json(200, payload)
+            return
+        # The Web Playback SDK device is this browser tab; Spotify reports no
+        # active device between "tab just reloaded" and "a device reconnects",
+        # which can be indistinguishable from "genuinely stopped". Fall back to
+        # the last known snapshot (frozen, not live) so the bar and playhead
+        # stay put across a refresh instead of going blank.
+        cached = get_last_playback()
+        if cached:
+            cached["playing"] = False
+            cached["live"] = False
+            self.send_json(200, cached)
+            return
+        self.send_json(200, {"playing": False, "progress_ms": 0, "device": None, "device_id": None,
+                              "track": None, "live": True})
 
     # -- PUT --
 
