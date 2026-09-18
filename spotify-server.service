@@ -12,9 +12,8 @@ Environment=PYTHONUNBUFFERED=1
 Environment=SPOTIFY_HOST=127.0.0.1
 Environment=SPOTIFY_PORT=8793
 Environment=SPOTIFY_DB=/opt/spotify/tokens.db
-Environment=SPOTIFY_CLIENT_ID=REDACTED
-Environment=SPOTIFY_CLIENT_SECRET=REDACTED
 Environment=SPOTIFY_REDIRECT_URI=https://spotify.example.com/spotify-api/callback
+EnvironmentFile=/opt/spotify/spotify.env
 ExecStart=/usr/bin/python3 /opt/spotify/server.py
 Restart=on-failure
 RestartSec=2
