@@ -549,8 +549,9 @@ SPOTIFY_PAGE = r"""<!doctype html>
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
          touch-action:manipulation; background:#fff; color:#000; min-height:100vh;
          padding:20px 20px 96px; }
-  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; position:relative; }
   .logo { height:32px; width:32px; display:block; }
+  header h1 { font-size:18px; margin:0; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); }
   .header-right { display:flex; align-items:center; gap:10px; }
   #authStatus { font-size:12px; color:#666; text-align:right; }
   #authStatus a { color:#666; text-decoration:underline; cursor:pointer; margin-left:8px; }
@@ -624,6 +625,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <body>
 <header>
   <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo">
+  <h1>Spotify</h1>
   <div class="header-right">
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
     <div id="authStatus"></div>
