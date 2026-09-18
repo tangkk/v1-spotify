@@ -23,9 +23,9 @@ Routes:
   GET  /spotify-api/callback              -> OAuth redirect target
   POST /spotify-api/logout                -> forget the linked account
   GET  /spotify-api/player-token          -> short-lived access_token for the Web Playback SDK
-  GET  /spotify-api/search/artists?q=
-  GET  /spotify-api/search/albums?q=
-  GET  /spotify-api/search/tracks?q=
+  GET  /spotify-api/search/artists?q=&offset=  -> {"items", "offset", "total", "has_more"}
+  GET  /spotify-api/search/albums?q=&offset=
+  GET  /spotify-api/search/tracks?q=&offset=
   GET  /spotify-api/artists/<id>/albums
   GET  /spotify-api/artists/<id>/dedup-tracks
   GET  /spotify-api/albums/<id>
@@ -310,14 +310,14 @@ def spotify_api(method, path, params=None, body=None, retry=True):
         raise SpotifyAPIError(exc.code, exc.read().decode("utf-8", "replace")) from exc
 
 
-def cached_search(kind, query, limit):
-    key = (kind, query.lower(), limit)
+def cached_search(kind, query, limit, offset=0):
+    key = (kind, query.lower(), limit, offset)
     now = time.time()
     with _search_cache_lock:
         hit = _search_cache.get(key)
         if hit and hit[0] > now:
             return hit[1]
-    result = spotify_api("GET", "/search", params={"q": query, "type": kind, "limit": limit})
+    result = spotify_api("GET", "/search", params={"q": query, "type": kind, "limit": limit, "offset": offset})
     with _search_cache_lock:
         if len(_search_cache) > 200:
             _search_cache.clear()
@@ -941,6 +941,11 @@ document.getElementById('searchInput').addEventListener('keydown', e => {
   if (q) goTo({type: 'search', query: q});
 });
 
+// searchState holds each column's accumulated items plus Spotify's total/
+// has_more, so "More" can fetch and append just that one column's next page
+// without re-running the other two searches.
+let searchState = null;
+
 async function runSearch(query) {
   const err = document.getElementById('searchError');
   err.textContent = '';
@@ -951,70 +956,89 @@ async function runSearch(query) {
       api('/spotify-api/search/albums?q=' + encodeURIComponent(query)),
       api('/spotify-api/search/tracks?q=' + encodeURIComponent(query)),
     ]);
-    renderSearchResults(artists.items, albums.items, tracks.items);
+    searchState = {query, artist: artists, album: albums, track: tracks};
+    renderSearchResults();
   } catch (e) { err.textContent = 'Search failed: ' + e.message; }
 }
 
-function renderSearchResults(artists, albums, tracks) {
+async function loadMoreSearch(kind, btn) {
+  const data = searchState[kind];
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  try {
+    const page = await api('/spotify-api/search/' + kind + 's?q=' + encodeURIComponent(searchState.query) +
+                            '&offset=' + data.items.length);
+    data.items = data.items.concat(page.items);
+    data.has_more = page.has_more;
+    renderSearchResults();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'More';
+  }
+}
+
+function buildResultColumn(title, kind, emptyLabel, rowFn) {
+  const data = searchState[kind];
+  const col = el('div');
+  col.appendChild(el('h2', null, title));
+  const list = el('ul', 'list');
+  if (!data.items.length) list.appendChild(el('li', 'empty', emptyLabel));
+  for (const item of data.items) list.appendChild(rowFn(item));
+  col.appendChild(list);
+  if (data.has_more) {
+    const moreBtn = el('button', 'button small', 'More');
+    moreBtn.style.marginTop = '8px';
+    moreBtn.onclick = () => loadMoreSearch(kind, moreBtn);
+    col.appendChild(moreBtn);
+  }
+  return col;
+}
+
+function artistRow(a) {
+  const li = el('li');
+  li.appendChild(coverImg(a.image));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', a.name));
+  meta.appendChild(el('div', 'sub', (a.genres || []).slice(0, 3).join(', ') || 'Artist'));
+  meta.onclick = () => goTo({type: 'artist', id: a.id, name: a.name});
+  li.appendChild(meta);
+  return li;
+}
+
+function albumRow(a) {
+  const li = el('li');
+  li.appendChild(coverImg(a.image));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', a.name));
+  meta.appendChild(el('div', 'sub', (a.artists || []).join(', ') + ' · ' + (a.release_date || '').slice(0, 4)));
+  meta.onclick = () => goTo({type: 'album', id: a.id});
+  li.appendChild(meta);
+  return li;
+}
+
+function trackRow(t) {
+  // Start the track's own album context at this track, same continuation
+  // behavior as every other play entry point in the app.
+  const playFromHere = () => playUris(null, 'spotify:album:' + t.album_id, {uri: t.uri});
+  const li = el('li');
+  li.appendChild(coverImg(t.image));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'title', t.name));
+  meta.appendChild(el('div', 'sub', t.artists.join(', ') + ' · ' + t.album_name + ' · ' + fmtDuration(t.duration_ms)));
+  meta.onclick = playFromHere;
+  li.appendChild(meta);
+  const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
+  li.appendChild(playBtn);
+  return li;
+}
+
+function renderSearchResults() {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const cols = el('div', ''); cols.id = 'columns';
-  const artistCol = el('div');
-  artistCol.appendChild(el('h2', null, 'Artists'));
-  const artistList = el('ul', 'list');
-  if (!artists.length) artistList.appendChild(el('li', 'empty', 'No artists'));
-  for (const a of artists) {
-    const li = el('li');
-    li.appendChild(coverImg(a.image));
-    const meta = el('div', 'meta');
-    meta.appendChild(el('div', 'title', a.name));
-    meta.appendChild(el('div', 'sub', (a.genres || []).slice(0, 3).join(', ') || 'Artist'));
-    meta.onclick = () => goTo({type: 'artist', id: a.id, name: a.name});
-    li.appendChild(meta);
-    artistList.appendChild(li);
-  }
-  artistCol.appendChild(artistList);
-
-  const albumCol = el('div');
-  albumCol.appendChild(el('h2', null, 'Albums'));
-  const albumList = el('ul', 'list');
-  if (!albums.length) albumList.appendChild(el('li', 'empty', 'No albums'));
-  for (const a of albums) {
-    const li = el('li');
-    li.appendChild(coverImg(a.image));
-    const meta = el('div', 'meta');
-    meta.appendChild(el('div', 'title', a.name));
-    meta.appendChild(el('div', 'sub', (a.artists || []).join(', ') + ' · ' + (a.release_date || '').slice(0, 4)));
-    meta.onclick = () => goTo({type: 'album', id: a.id});
-    li.appendChild(meta);
-    albumList.appendChild(li);
-  }
-  albumCol.appendChild(albumList);
-
-  const trackCol = el('div');
-  trackCol.appendChild(el('h2', null, 'Tracks'));
-  const trackList = el('ul', 'list');
-  if (!tracks.length) trackList.appendChild(el('li', 'empty', 'No tracks'));
-  for (const t of tracks) {
-    // Start the track's own album context at this track, same continuation
-    // behavior as every other play entry point in the app.
-    const playFromHere = () => playUris(null, 'spotify:album:' + t.album_id, {uri: t.uri});
-    const li = el('li');
-    li.appendChild(coverImg(t.image));
-    const meta = el('div', 'meta');
-    meta.appendChild(el('div', 'title', t.name));
-    meta.appendChild(el('div', 'sub', t.artists.join(', ') + ' · ' + t.album_name + ' · ' + fmtDuration(t.duration_ms)));
-    meta.onclick = playFromHere;
-    li.appendChild(meta);
-    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
-    li.appendChild(playBtn);
-    trackList.appendChild(li);
-  }
-  trackCol.appendChild(trackList);
-
-  cols.appendChild(artistCol);
-  cols.appendChild(albumCol);
-  cols.appendChild(trackCol);
+  cols.appendChild(buildResultColumn('Artists', 'artist', 'No artists', artistRow));
+  cols.appendChild(buildResultColumn('Albums', 'album', 'No albums', albumRow));
+  cols.appendChild(buildResultColumn('Tracks', 'track', 'No tracks', trackRow));
   view.appendChild(cols);
 }
 
@@ -1545,8 +1569,14 @@ class Handler(BaseHTTPRequestHandler):
             limit = min(max(int(query.get("limit", [str(SPOTIFY_PAGE_LIMIT)])[0]), 1), SPOTIFY_PAGE_LIMIT)
         except ValueError:
             limit = SPOTIFY_PAGE_LIMIT
-        result = cached_search(kind, q, limit)
-        items = (result.get(kind + "s") or {}).get("items", [])
+        try:
+            offset = max(0, int(query.get("offset", ["0"])[0]))
+        except ValueError:
+            offset = 0
+        result = cached_search(kind, q, limit, offset)
+        block = result.get(kind + "s") or {}
+        items = block.get("items", [])
+        total = block.get("total", len(items))
         out = []
         for item in items:
             if not item:
@@ -1572,7 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
                 entry["release_date"] = item.get("release_date", "")
                 entry["album_type"] = item.get("album_type", "")
             out.append(entry)
-        self.send_json(200, {"items": out})
+        self.send_json(200, {"items": out, "offset": offset, "total": total, "has_more": offset + len(items) < total})
 
     def handle_artist_albums(self, artist_id, query):
         groups = query.get("groups", ["album,single,compilation"])[0]
