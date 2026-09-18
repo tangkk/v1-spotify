@@ -1241,7 +1241,7 @@ document.getElementById('npNext').onclick = async () => {
   await api('/spotify-api/player/next', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
 };
-document.getElementById('npPlay').onclick = async () => {
+async function togglePlayPause() {
   await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
@@ -1261,7 +1261,18 @@ document.getElementById('npPlay').onclick = async () => {
     await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   }
   pollNowPlaying();
-};
+}
+document.getElementById('npPlay').onclick = togglePlayPause;
+
+// Spacebar play/pause, except while actually typing (a text input/textarea
+// focused, or a button mid-activation via a real space keypress on it).
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space' && e.key !== ' ') return;
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
+  e.preventDefault();
+  togglePlayPause();
+});
 document.getElementById('npVolume').onchange = async e => {
   const device_id = await ensureDevice();
   if (!device_id) return;
