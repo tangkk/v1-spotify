@@ -31,6 +31,7 @@ Routes:
   GET  /spotify-api/albums/<id>
   GET  /spotify-api/devices
   GET  /spotify-api/recently-played
+  GET  /spotify-api/player/queue       -> {"currently_playing": {...}|null, "queue": [...]}
   GET  /spotify-api/player/now-playing
   PUT  /spotify-api/player/transfer   {"device_id": "...", "play": true}
   PUT  /spotify-api/player/play       {"device_id", "uris"|"context_uri", "offset", "position_ms"}
@@ -392,6 +393,21 @@ def fetch_artist_albums(artist_id, groups, limit_total=200):
     return albums[:limit_total]
 
 
+def track_summary(t):
+    """Common {id, uri, name, image, artists, album_id, album_name, duration_ms}
+    shape used by search/recently-played/queue -- all render via the same
+    frontend trackRow()."""
+    if not t:
+        return None
+    album = t.get("album") or {}
+    images = album.get("images") or []
+    return {"id": t.get("id"), "uri": t.get("uri"), "name": t.get("name"),
+            "image": images[0]["url"] if images else None,
+            "artists": [a["name"] for a in t.get("artists", [])],
+            "album_id": album.get("id"), "album_name": album.get("name", ""),
+            "duration_ms": t.get("duration_ms", 0)}
+
+
 def fetch_album_tracks(album_id, limit_total=300):
     tracks = []
     offset = 0
@@ -556,7 +572,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
   .logo { height:32px; width:32px; display:block; }
   .header-right { display:flex; align-items:center; gap:10px; }
   #authStatus { font-size:12px; color:#666; text-align:right; }
-  #authStatus a { color:#666; text-decoration:underline; cursor:pointer; margin-left:8px; }
+  #authStatus a { color:#666; text-decoration:underline; cursor:pointer; }
   .panel { border:1px solid #000; padding:14px 16px; margin-bottom:20px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .button { padding:8px 16px; border:1px solid #000; background:#fff; color:#000;
@@ -629,6 +645,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <header>
   <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo">
   <div class="header-right">
+    <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
     <div id="authStatus"></div>
   </div>
@@ -750,8 +768,9 @@ function renderAuthArea(status) {
     connectPanel.appendChild(btn);
     return;
   }
-  authStatus.textContent = 'Connected as ' + (status.display_name || 'Spotify user') +
-    (status.premium ? '' : ' (not Premium — playback will fail)');
+  // Its mere presence already implies "connected" (connectPanel above covers
+  // the disconnected state), so no need for a "Connected as X" line here too
+  // -- kept minimal for iOS header space.
   const disconnect = el('a', null, 'Disconnect');
   disconnect.onclick = async () => {
     if (!confirm('Disconnect Spotify?')) return;
@@ -881,6 +900,7 @@ async function renderDescriptor(d) {
   if (d.type === 'album') { await loadAlbum(d.id, d.queueCtx); return; }
   if (d.type === 'dedup') { await loadDedup(d.id, d.name); return; }
   if (d.type === 'favorites') { await loadFavorites(); return; }
+  if (d.type === 'queue') { await loadQueueView(); return; }
 }
 
 function pushViewState(view) {
@@ -939,6 +959,33 @@ setInterval(pollViewState, 3000);
 // ---- favorites ----
 
 document.getElementById('favoritesButton').onclick = () => goTo({type: 'favorites'});
+document.getElementById('recentlyPlayedButton').onclick = () => goTo({type: 'home'});
+document.getElementById('queueViewButton').onclick = () => goTo({type: 'queue'});
+
+async function loadQueueView() {
+  const view = document.getElementById('view');
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const {currently_playing, queue} = await api('/spotify-api/player/queue');
+    renderQueueView(currently_playing, queue);
+  } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
+}
+
+function renderQueueView(currentlyPlaying, queue) {
+  const view = document.getElementById('view');
+  view.innerHTML = '';
+  if (currentlyPlaying) {
+    view.appendChild(el('h2', null, 'Now Playing'));
+    const nowList = el('ul', 'list');
+    nowList.appendChild(trackRow(currentlyPlaying));
+    view.appendChild(nowList);
+  }
+  view.appendChild(el('h2', null, 'Up Next'));
+  const list = el('ul', 'list');
+  if (!queue.length) list.appendChild(el('li', 'empty', 'Nothing queued'));
+  for (const t of queue) list.appendChild(trackRow(t));
+  view.appendChild(list);
+}
 
 // Spotify rarely populates album-level genres, so favorites are tagged by
 // hand from this fixed list instead of anything derived from the API --
@@ -1664,6 +1711,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_devices(); return
         if path == "/spotify-api/recently-played":
             self.handle_recently_played(); return
+        if path == "/spotify-api/player/queue":
+            self.handle_queue(); return
         if path == "/spotify-api/player/now-playing":
             self.handle_now_playing(); return
         if path == "/spotify-api/view-state":
@@ -1837,19 +1886,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_recently_played(self):
         result = spotify_api("GET", "/me/player/recently-played", params={"limit": SPOTIFY_PAGE_LIMIT})
-        out = []
-        for entry in result.get("items", []):
-            track = entry.get("track") or {}
-            album = track.get("album") or {}
-            images = album.get("images") or []
-            out.append({
-                "id": track.get("id"), "uri": track.get("uri"), "name": track.get("name"),
-                "image": images[0]["url"] if images else None,
-                "artists": [a["name"] for a in track.get("artists", [])],
-                "album_id": album.get("id"), "album_name": album.get("name", ""),
-                "duration_ms": track.get("duration_ms", 0),
-            })
-        self.send_json(200, {"items": out})
+        out = [track_summary(entry.get("track")) for entry in result.get("items", [])]
+        self.send_json(200, {"items": [t for t in out if t]})
+
+    def handle_queue(self):
+        result = spotify_api("GET", "/me/player/queue")
+        self.send_json(200, {
+            "currently_playing": track_summary(result.get("currently_playing")),
+            "queue": [t for t in (track_summary(x) for x in result.get("queue", [])) if t],
+        })
 
     def handle_now_playing(self):
         result = spotify_api("GET", "/me/player")
