@@ -570,8 +570,6 @@ SPOTIFY_PAGE = r"""<!doctype html>
     #nowplaying .track .sub { display:none; }
     #nowplaying .controls button { padding:6px 8px; font-size:11px; }
   }
-  #columns { display:flex; gap:24px; flex-wrap:wrap; }
-  #columns > div { flex:1; min-width:260px; }
 </style>
 </head>
 <body>
@@ -588,7 +586,9 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <div id="searchPanel" class="panel" style="display:none">
   <div class="row">
     <input type="text" id="searchInput" placeholder="Search artists or albums">
-    <button class="icon-btn" id="searchButton" title="Search"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="2"/><line x1="13.5" y1="13.5" x2="18" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button class="icon-btn" id="searchArtistButton" title="Search artists"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="6.8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 17c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+    <button class="icon-btn" id="searchAlbumButton" title="Search albums"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="10" cy="10" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+    <button class="icon-btn" id="searchTrackButton" title="Search tracks"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="6.5" cy="15" r="2.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.8 15V4.5L15 3v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="coversButton" title="Show covers"><svg width="18" height="18" viewBox="0 0 20 20"><rect x="2" y="4" width="16" height="12" rx="1" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="9" r="1.5" fill="currentColor"/><path d="M3 15l4.5-4.5 3 3 3-4 3.5 5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
   </div>
   <div id="searchError" class="error"></div>
@@ -823,7 +823,7 @@ let currentDescriptor = {type: 'home'};
 
 async function renderDescriptor(d) {
   if (!d || d.type === 'home') { document.getElementById('view').innerHTML = ''; return; }
-  if (d.type === 'search') { document.getElementById('searchInput').value = d.query || ''; await runSearch(d.query); return; }
+  if (d.type === 'search') { document.getElementById('searchInput').value = d.query || ''; await runSearch(d.query, d.kind || 'artist'); return; }
   if (d.type === 'artist') { await loadArtist(d.id, d.name); return; }
   if (d.type === 'album') { await loadAlbum(d.id, d.queueCtx); return; }
   if (d.type === 'dedup') { await loadDedup(d.id, d.name); return; }
@@ -929,67 +929,55 @@ document.getElementById('coversButton').onclick = () => {
   applyCoversVisibility();
 };
 
-document.getElementById('searchButton').onclick = () => {
+// Search is split into three buttons (one Spotify API call each) instead of
+// always querying all three types together, since most searches only care
+// about one of them. Enter repeats whichever type was last used.
+let lastSearchKind = 'artist';
+
+function triggerSearch(kind) {
   const q = document.getElementById('searchInput').value.trim();
-  if (q) goTo({type: 'search', query: q});
-};
+  if (q) goTo({type: 'search', query: q, kind});
+}
+document.getElementById('searchArtistButton').onclick = () => triggerSearch('artist');
+document.getElementById('searchAlbumButton').onclick = () => triggerSearch('album');
+document.getElementById('searchTrackButton').onclick = () => triggerSearch('track');
 document.getElementById('searchInput').addEventListener('keydown', e => {
-  if (e.key !== 'Enter') return;
-  const q = e.target.value.trim();
-  if (q) goTo({type: 'search', query: q});
+  if (e.key === 'Enter') triggerSearch(lastSearchKind);
 });
 
-// searchState holds each column's accumulated items plus Spotify's total/
-// has_more, so "More" can fetch and append just that one column's next page
-// without re-running the other two searches.
+// searchState holds the current single-type result set plus Spotify's
+// has_more, so "More" can fetch and append the next page in place.
 let searchState = null;
 
-async function runSearch(query) {
+const SEARCH_KIND_LABEL = {artist: 'Artists', album: 'Albums', track: 'Tracks'};
+const SEARCH_KIND_EMPTY = {artist: 'No artists', album: 'No albums', track: 'No tracks'};
+const SEARCH_KIND_ROW = {artist: artistRow, album: albumRow, track: trackRow};
+
+async function runSearch(query, kind) {
   const err = document.getElementById('searchError');
   err.textContent = '';
   if (!query) return;
+  lastSearchKind = kind;
   try {
-    const [artists, albums, tracks] = await Promise.all([
-      api('/spotify-api/search/artists?q=' + encodeURIComponent(query)),
-      api('/spotify-api/search/albums?q=' + encodeURIComponent(query)),
-      api('/spotify-api/search/tracks?q=' + encodeURIComponent(query)),
-    ]);
-    searchState = {query, artist: artists, album: albums, track: tracks};
+    const result = await api('/spotify-api/search/' + kind + 's?q=' + encodeURIComponent(query));
+    searchState = {query, kind, items: result.items, has_more: result.has_more};
     renderSearchResults();
   } catch (e) { err.textContent = 'Search failed: ' + e.message; }
 }
 
-async function loadMoreSearch(kind, btn) {
-  const data = searchState[kind];
+async function loadMoreSearch(btn) {
   btn.disabled = true;
   btn.textContent = 'Loading…';
   try {
-    const page = await api('/spotify-api/search/' + kind + 's?q=' + encodeURIComponent(searchState.query) +
-                            '&offset=' + data.items.length);
-    data.items = data.items.concat(page.items);
-    data.has_more = page.has_more;
+    const page = await api('/spotify-api/search/' + searchState.kind + 's?q=' + encodeURIComponent(searchState.query) +
+                            '&offset=' + searchState.items.length);
+    searchState.items = searchState.items.concat(page.items);
+    searchState.has_more = page.has_more;
     renderSearchResults();
   } catch (e) {
     btn.disabled = false;
     btn.textContent = 'More';
   }
-}
-
-function buildResultColumn(title, kind, emptyLabel, rowFn) {
-  const data = searchState[kind];
-  const col = el('div');
-  col.appendChild(el('h2', null, title));
-  const list = el('ul', 'list');
-  if (!data.items.length) list.appendChild(el('li', 'empty', emptyLabel));
-  for (const item of data.items) list.appendChild(rowFn(item));
-  col.appendChild(list);
-  if (data.has_more) {
-    const moreBtn = el('button', 'button small', 'More');
-    moreBtn.style.marginTop = '8px';
-    moreBtn.onclick = () => loadMoreSearch(kind, moreBtn);
-    col.appendChild(moreBtn);
-  }
-  return col;
 }
 
 function artistRow(a) {
@@ -1033,11 +1021,18 @@ function trackRow(t) {
 function renderSearchResults() {
   const view = document.getElementById('view');
   view.innerHTML = '';
-  const cols = el('div', ''); cols.id = 'columns';
-  cols.appendChild(buildResultColumn('Artists', 'artist', 'No artists', artistRow));
-  cols.appendChild(buildResultColumn('Albums', 'album', 'No albums', albumRow));
-  cols.appendChild(buildResultColumn('Tracks', 'track', 'No tracks', trackRow));
-  view.appendChild(cols);
+  const {kind, items, has_more} = searchState;
+  view.appendChild(el('h2', null, SEARCH_KIND_LABEL[kind]));
+  const list = el('ul', 'list');
+  if (!items.length) list.appendChild(el('li', 'empty', SEARCH_KIND_EMPTY[kind]));
+  for (const item of items) list.appendChild(SEARCH_KIND_ROW[kind](item));
+  view.appendChild(list);
+  if (has_more) {
+    const moreBtn = el('button', 'button small', 'More');
+    moreBtn.style.marginTop = '8px';
+    moreBtn.onclick = () => loadMoreSearch(moreBtn);
+    view.appendChild(moreBtn);
+  }
 }
 
 async function loadArtist(id, name) {
