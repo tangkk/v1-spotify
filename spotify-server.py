@@ -1053,9 +1053,15 @@ function renderArtistView(artist) {
   view.appendChild(crumbs);
   view.appendChild(el('h2', null, artist.name));
 
-  const dedupBtn = el('button', 'button small', 'Build deduplicated track list');
-  dedupBtn.onclick = () => goTo({type: 'dedup', id: artist.id, name: artist.name});
-  view.appendChild(dedupBtn);
+  // Hidden for now: building a dedup list calls fetch_artist_albums *and*
+  // fetch_album_tracks for every single album, which is by far the heaviest
+  // consumer of this app's daily per-endpoint Spotify quota. The backend
+  // route and loadDedup/renderDedupView are untouched -- this is just the
+  // entry point, easy to re-add once Extended Quota Mode lifts that limit.
+  //
+  // const dedupBtn = el('button', 'button small', 'Build deduplicated track list');
+  // dedupBtn.onclick = () => goTo({type: 'dedup', id: artist.id, name: artist.name});
+  // view.appendChild(dedupBtn);
 
   const groups = {album: [], single: [], compilation: [], appears_on: []};
   for (const a of artist.albums) (groups[a.album_type] || groups.appears_on).push(a);
