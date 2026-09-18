@@ -1,0 +1,27 @@
+[Unit]
+Description=V1 Spotify Companion Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/spotify
+Environment=PYTHONUNBUFFERED=1
+Environment=SPOTIFY_HOST=127.0.0.1
+Environment=SPOTIFY_PORT=8793
+Environment=SPOTIFY_DB=/opt/spotify/tokens.db
+Environment=SPOTIFY_CLIENT_ID=REDACTED
+Environment=SPOTIFY_CLIENT_SECRET=REDACTED
+Environment=SPOTIFY_REDIRECT_URI=https://spotify.example.com/spotify-api/callback
+ExecStart=/usr/bin/python3 /opt/spotify/server.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/spotify
+
+[Install]
+WantedBy=multi-user.target
