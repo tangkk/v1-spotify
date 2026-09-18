@@ -40,9 +40,10 @@ Routes:
   POST /spotify-api/player/previous   {"device_id"}
   GET  /spotify-api/view-state        -> {"view": {...}|null, "updated_at", "updated_by"}
   PUT  /spotify-api/view-state        {"view": {...}, "client_id": "..."} -- cross-device "what's on screen" sync
-  GET    /spotify-api/favorites            -> {"items": [{id, name, artists, image, added_at}]}
+  GET    /spotify-api/favorites            -> {"items": [{id, name, artists, image, release_date, genres, added_at}]}
   GET    /spotify-api/favorites/<album_id> -> {"favorited": bool}
-  PUT    /spotify-api/favorites/<album_id> {"name", "artists", "image"} -- add/update a favorite album
+  PUT    /spotify-api/favorites/<album_id> {"name", "artists", "image", "album_type", "release_date", "tracks"} -- add/update a favorite album
+  PUT    /spotify-api/favorites/<album_id>/genres {"genres": [...]} -- hand-tagged genres (Spotify rarely has album-level genre data)
   DELETE /spotify-api/favorites/<album_id> -- remove a favorite album
 """
 import base64
@@ -82,6 +83,7 @@ ARTIST_ALBUMS_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/album
 ARTIST_DEDUP_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/dedup-tracks$")
 ALBUM_RE = re.compile(r"^/spotify-api/albums/([A-Za-z0-9]{10,40})$")
 FAVORITE_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})$")
+FAVORITE_GENRES_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})/genres$")
 ALBUM_TYPE_RANK = {"album": 3, "single": 2, "compilation": 1, "appears_on": 0}
 
 _search_cache = {}
@@ -161,7 +163,8 @@ def db():
     # the first.
     for stmt in ("ALTER TABLE favorite_albums ADD COLUMN album_type TEXT",
                  "ALTER TABLE favorite_albums ADD COLUMN release_date TEXT",
-                 "ALTER TABLE favorite_albums ADD COLUMN tracks TEXT"):
+                 "ALTER TABLE favorite_albums ADD COLUMN tracks TEXT",
+                 "ALTER TABLE favorite_albums ADD COLUMN genres TEXT"):
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError:
@@ -227,8 +230,16 @@ def remove_favorite(album_id):
 def list_favorites():
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, name, artists, image, added_at FROM favorite_albums ORDER BY added_at DESC").fetchall()
-    return [{"id": r[0], "name": r[1], "artists": json.loads(r[2]), "image": r[3], "added_at": r[4]} for r in rows]
+            "SELECT id, name, artists, image, release_date, genres, added_at "
+            "FROM favorite_albums ORDER BY added_at DESC").fetchall()
+    return [{"id": r[0], "name": r[1], "artists": json.loads(r[2]), "image": r[3],
+             "release_date": r[4], "genres": json.loads(r[5]) if r[5] else [], "added_at": r[6]} for r in rows]
+
+
+def set_favorite_genres(album_id, genres):
+    with db() as conn:
+        conn.execute("UPDATE favorite_albums SET genres=? WHERE id=?", (json.dumps(genres), album_id))
+        conn.commit()
 
 
 def is_favorite(album_id):
@@ -565,6 +576,13 @@ SPOTIFY_PAGE = r"""<!doctype html>
   ul.list { list-style:none; margin:0; padding:0; }
   ul.list li { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid #eee; }
   ul.list li:last-child { border-bottom:none; }
+  ul.list li.fav-item { flex-wrap:wrap; }
+  select { padding:6px 8px; border:1px solid #999; background:#fff; color:#000; font:inherit; font-size:13px; -webkit-appearance:none; appearance:none; }
+  .genre-tags { display:flex; flex-wrap:wrap; gap:4px; width:100%; margin:2px 0 0 50px; }
+  .chip { padding:2px 8px; border:1px solid #999; background:#fff; color:#666; font:inherit; font-size:11px;
+          cursor:pointer; -webkit-appearance:none; appearance:none; }
+  .chip:hover { border-color:#000; color:#000; }
+  .chip.active { background:#000; border-color:#000; color:#fff; }
   .cover { width:40px; height:40px; object-fit:cover; background:#eee; flex:none; }
   .cover.lg { width:64px; height:64px; }
   .meta { flex:1; min-width:0; cursor:pointer; }
@@ -616,7 +634,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
 
 <div id="searchPanel" class="panel" style="display:none">
   <div class="row">
-    <input type="text" id="searchInput" placeholder="Search artists or albums">
+    <input type="text" id="searchInput">
     <button class="icon-btn" id="searchArtistButton" title="Search artists"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="6.8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 17c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="searchAlbumButton" title="Search albums"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="10" cy="10" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
     <button class="icon-btn" id="searchTrackButton" title="Search tracks"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="6.5" cy="15" r="2.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.8 15V4.5L15 3v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
@@ -918,16 +936,45 @@ setInterval(pollViewState, 3000);
 
 document.getElementById('favoritesButton').onclick = () => goTo({type: 'favorites'});
 
+// Spotify rarely populates album-level genres, so favorites are tagged by
+// hand from this fixed list instead of anything derived from the API --
+// kept small on purpose, this is a personal library filter, not a taxonomy.
+const COMMON_GENRES = ['Jazz', 'Rock', 'Pop', 'Classical', 'Electronic', 'Hip-Hop', 'Folk', 'Blues', 'Metal', 'Soul'];
+const UNTAGGED = '__untagged__';
+const UNKNOWN_ERA = '__unknown__';
+
+function eraOf(releaseDate) {
+  const year = releaseDate ? parseInt(releaseDate.slice(0, 4), 10) : NaN;
+  return year ? (Math.floor(year / 10) * 10) + 's' : '';
+}
+
+let favoritesState = null;
+let favoritesFilter = {artist: '', genre: '', era: ''};
+
 async function loadFavorites() {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const {items} = await api('/spotify-api/favorites');
-    renderFavoritesView(items);
+    favoritesState = items;
+    favoritesFilter = {artist: '', genre: '', era: ''};
+    renderFavoritesView();
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
-function renderFavoritesView(items) {
+function buildFilterSelect(options, selected, onChange) {
+  const select = el('select');
+  for (const [value, label] of options) {
+    const opt = el('option', null, label);
+    opt.value = value;
+    if (value === selected) opt.selected = true;
+    select.appendChild(opt);
+  }
+  select.onchange = () => onChange(select.value);
+  return select;
+}
+
+function renderFavoritesView() {
   const view = document.getElementById('view');
   view.innerHTML = '';
   const crumbs = el('div', 'crumbs');
@@ -935,16 +982,62 @@ function renderFavoritesView(items) {
   crumbs.appendChild(back);
   view.appendChild(crumbs);
   view.appendChild(el('h2', null, 'Favorite Albums'));
+
+  const artists = [...new Set(favoritesState.flatMap(a => a.artists || []))].sort();
+  const eras = [...new Set(favoritesState.map(a => eraOf(a.release_date)).filter(Boolean))].sort();
+  const hasUnknownEra = favoritesState.some(a => !eraOf(a.release_date));
+
+  const filterRow = el('div', 'row');
+  filterRow.style.marginBottom = '14px';
+  filterRow.appendChild(buildFilterSelect(
+    [['', 'All artists'], ...artists.map(a => [a, a])], favoritesFilter.artist,
+    v => { favoritesFilter.artist = v; renderFavoritesView(); }));
+  filterRow.appendChild(buildFilterSelect(
+    [['', 'All genres'], ...COMMON_GENRES.map(g => [g, g]), [UNTAGGED, 'Untagged']], favoritesFilter.genre,
+    v => { favoritesFilter.genre = v; renderFavoritesView(); }));
+  const eraOptions = [['', 'All eras'], ...eras.map(e => [e, e])];
+  if (hasUnknownEra) eraOptions.push([UNKNOWN_ERA, 'Unknown era']);
+  filterRow.appendChild(buildFilterSelect(eraOptions, favoritesFilter.era,
+    v => { favoritesFilter.era = v; renderFavoritesView(); }));
+  view.appendChild(filterRow);
+
+  const filtered = favoritesState.filter(a => {
+    if (favoritesFilter.artist && !(a.artists || []).includes(favoritesFilter.artist)) return false;
+    const genres = a.genres || [];
+    if (favoritesFilter.genre === UNTAGGED && genres.length) return false;
+    if (favoritesFilter.genre && favoritesFilter.genre !== UNTAGGED && !genres.includes(favoritesFilter.genre)) return false;
+    const era = eraOf(a.release_date);
+    if (favoritesFilter.era === UNKNOWN_ERA && era) return false;
+    if (favoritesFilter.era && favoritesFilter.era !== UNKNOWN_ERA && era !== favoritesFilter.era) return false;
+    return true;
+  });
+
   const list = el('ul', 'list');
-  if (!items.length) list.appendChild(el('li', 'empty', 'No favorites yet'));
-  for (const a of items) {
-    const li = el('li');
+  if (!filtered.length) {
+    list.appendChild(el('li', 'empty', favoritesState.length ? 'No favorites match these filters' : 'No favorites yet'));
+  }
+  for (const a of filtered) {
+    const li = el('li', 'fav-item');
     li.appendChild(coverImg(a.image));
     const meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', a.name));
     meta.appendChild(el('div', 'sub', (a.artists || []).join(', ')));
     meta.onclick = () => goTo({type: 'album', id: a.id});
     li.appendChild(meta);
+    const tags = el('div', 'genre-tags');
+    for (const g of COMMON_GENRES) {
+      const active = (a.genres || []).includes(g);
+      const chip = el('button', active ? 'chip active' : 'chip', g);
+      chip.onclick = async () => {
+        const genres = a.genres || [];
+        a.genres = active ? genres.filter(x => x !== g) : [...genres, g];
+        await api('/spotify-api/favorites/' + a.id + '/genres', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({genres: a.genres})});
+        renderFavoritesView();
+      };
+      tags.appendChild(chip);
+    }
+    li.appendChild(tags);
     list.appendChild(li);
   }
   view.appendChild(list);
@@ -1790,6 +1883,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/spotify-api/view-state":
             body = self.read_json_body()
             set_view_state(body.get("view"), body.get("client_id"))
+            self.send_json(200, {"ok": True}); return
+        match = FAVORITE_GENRES_RE.match(path)
+        if match:
+            body = self.read_json_body()
+            genres = body.get("genres")
+            if not isinstance(genres, list):
+                self.send_json(400, {"error": "genres_must_be_array"}); return
+            set_favorite_genres(match.group(1), [str(g) for g in genres][:10])
             self.send_json(200, {"ok": True}); return
         match = FAVORITE_RE.match(path)
         if match:
