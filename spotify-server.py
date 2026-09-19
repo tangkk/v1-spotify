@@ -1349,6 +1349,17 @@ function iconButton(svg, title, cls) {
   return btn;
 }
 
+const ICON_PLUS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+
+// Row action buttons (play / add to queue / remove) are the same 38px icon
+// buttons as the header and the transport bar.
+function playRowButton(onclick) {
+  const btn = iconButton(ICON_PLAY, 'Play');
+  btn.onclick = onclick;
+  return btn;
+}
+
 function fmtDuration(ms) {
   const s = Math.round(ms / 1000);
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
@@ -1628,8 +1639,7 @@ async function loadQueueView() {
 }
 
 function removeButton(list, index, uri) {
-  const btn = el('button', 'button small', '×');
-  btn.title = 'Remove from queue';
+  const btn = iconButton(ICON_CROSS, 'Remove from queue');
   btn.onclick = async e => {
     e.stopPropagation();
     btn.disabled = true;
@@ -1914,8 +1924,7 @@ function showToast(message) {
 }
 
 function queueButton(track, onDone) {
-  const btn = el('button', 'button small', '+');
-  btn.title = 'Add to queue';
+  const btn = iconButton(ICON_PLUS, 'Add to queue');
   btn.onclick = async e => {
     e.stopPropagation();
     btn.disabled = true;
@@ -1942,8 +1951,7 @@ function trackRow(t, actionBtn) {
   meta.appendChild(el('div', 'sub', t.artists.join(', ') + ' · ' + t.album_name + ' · ' + fmtDuration(t.duration_ms)));
   meta.onclick = playFromHere;
   li.appendChild(meta);
-  const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
-  li.appendChild(playBtn);
+  li.appendChild(playRowButton(playFromHere));
   for (const b of (actionBtn ? [].concat(actionBtn) : [queueButton(t)])) li.appendChild(b);
   return li;
 }
@@ -2061,7 +2069,7 @@ function renderDedupView(artist, items) {
   crumbs.appendChild(back);
   view.appendChild(crumbs);
   view.appendChild(el('h2', null, artist.name + ' · Deduplicated (' + items.length + ' songs)'));
-  const playAll = el('button', 'button primary small', 'Play all');
+  const playAll = iconButton(ICON_PLAY, 'Play all', 'icon-btn active');
   playAll.onclick = () => playUris(items.slice(0, 50).map(t => t.uri));
   view.appendChild(playAll);
   const list = el('ul', 'list');
@@ -2079,8 +2087,7 @@ function renderDedupView(artist, items) {
     meta.appendChild(sub);
     meta.onclick = () => playUris(queueFrom(i));
     li.appendChild(meta);
-    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = () => playUris(queueFrom(i));
-    li.appendChild(playBtn);
+    li.appendChild(playRowButton(() => playUris(queueFrom(i))));
     list.appendChild(li);
     if (t.variant_count > 1) {
       const variants = el('div', 'variants');
@@ -2123,12 +2130,12 @@ async function renderAlbumView(album) {
 
   const actions = el('div', 'row');
   actions.style.marginTop = '10px';
-  const playAlbumBtn = el('button', 'button primary small', 'Play album');
+  // Solid black (the "active" look) marks it as the primary action next to the outlined buttons.
+  const playAlbumBtn = iconButton(ICON_PLAY, 'Play album', 'icon-btn active');
   playAlbumBtn.onclick = () => playAlbumNow(album.id);
   actions.appendChild(playAlbumBtn);
 
   const favBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>', 'Add to favorites', 'icon-btn small');
-  favBtn.style.width = '32px'; favBtn.style.height = '32px';
   let favorited = false;
   try { const st = await api('/spotify-api/favorites/' + album.id); favorited = !!st.favorited; } catch (e) {}
   const syncFavBtn = () => {
@@ -2172,8 +2179,7 @@ async function renderAlbumView(album) {
     meta2.appendChild(el('div', 'sub', (t.artists || []).join(', ') + ' · ' + fmtDuration(t.duration_ms)));
     meta2.onclick = playFromHere;
     li.appendChild(meta2);
-    const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
-    li.appendChild(playBtn);
+    li.appendChild(playRowButton(playFromHere));
     li.appendChild(queueButton(summary));
     list.appendChild(li);
   }
