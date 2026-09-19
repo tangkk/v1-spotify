@@ -2222,15 +2222,15 @@ function restartLockAudio(uri, seq) {
   }, 100);
 }
 
-// full: a new track. Its SDK event fires when the track starts *loading*, well
-// before the iframe really plays and iOS switches Now Playing back to it, so a
-// single restart at the event is too early: restart again at 1.5s and 4s.
+// full: a new track. Nothing is paused/restarted while the track is switching
+// (touching the silent element right then made the change itself slower); once
+// the new track is really playing, restart the silent element once at 3s.
 function reclaimNowPlaying(uri, paused, full) {
   if (!hasMediaSession) return;
   const seq = ++reclaimSeq;
   if (mediaMeta) applyMediaMetadata(mediaMeta);
-  if (lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri, seq);
-  const later = full ? [[1500, true], [4000, true], [8000, false]] : [[1500, false], [5000, false]];
+  if (!full && lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri, seq);
+  const later = full ? [[1500, false], [3000, true], [8000, false]] : [[1500, false], [5000, false]];
   for (const [ms, restart] of later) {
     setTimeout(() => {
       if (seq !== reclaimSeq || mediaTrackUri !== uri || !mediaMeta) return;   // a newer reclaim/track took over
@@ -2241,17 +2241,67 @@ function reclaimNowPlaying(uri, paused, full) {
   }
 }
 
+// Artwork is normally fetched by iOS itself *after* the metadata is set, and for a
+// new track that download can finish after the iframe's audio start has already
+// rewritten Now Playing (title survives, cover is lost; a pause/resume brings it
+// back only because by then the image is cached). So download it here instead
+// and hand iOS a data: URL, which needs no request; the next track's cover is
+// fetched ahead of time from the SDK's next_tracks.
+const artworkCache = new Map();   // image url -> data: URL (insertion-ordered, trimmed to 12)
+
+function pickArtworkUrl(images) {
+  const urls = (images || []).map(i => i.url).filter(Boolean);
+  // Spotify's ab67616d0000b273... is the 640px cover, ...1e02... the 300px one
+  return urls.find(u => u.includes('0000b273')) || urls.find(u => u.includes('00001e02')) || urls[0] || null;
+}
+
+function loadArtwork(url) {
+  if (!url) return Promise.resolve(null);
+  if (artworkCache.has(url)) return Promise.resolve(artworkCache.get(url));
+  return fetch(url, {mode: 'cors'})
+    .then(r => (r.ok ? r.blob() : Promise.reject(new Error('artwork ' + r.status))))
+    .then(blob => new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(fr.error);
+      fr.readAsDataURL(blob);
+    }))
+    .then(dataUrl => {
+      artworkCache.set(url, dataUrl);
+      while (artworkCache.size > 12) artworkCache.delete(artworkCache.keys().next().value);
+      return dataUrl;
+    })
+    .catch(() => null);
+}
+
+function dataUrlArtwork(dataUrl) {
+  const type = (/^data:([^;,]+)/.exec(dataUrl) || [])[1] || 'image/jpeg';
+  return [{src: dataUrl, sizes: '640x640', type}];
+}
+
 // A new track: take the metadata straight from the SDK event (no server round
 // trip, works in the background), then reclaim.
 function onSdkTrackChange(cur, st) {
   if (!hasMediaSession) return;
   const images = (cur.album && cur.album.images) || [];
+  const artUrl = pickArtworkUrl(images);
+  const cached = artUrl && artworkCache.get(artUrl);
   mediaTrackUri = cur.uri;
   applyMediaMetadata({
     title: cur.name || '', artist: (cur.artists || []).map(a => a.name).join(', '), album: (cur.album && cur.album.name) || '',
-    artwork: images.map(i => ({src: i.url, sizes: (i.width || 640) + 'x' + (i.height || 640), type: 'image/jpeg'})),
+    artwork: cached ? dataUrlArtwork(cached)
+      : images.map(i => ({src: i.url, sizes: (i.width || 640) + 'x' + (i.height || 640), type: 'image/jpeg'})),
   });
   reclaimNowPlaying(cur.uri, st.paused, true);
+  if (!cached) {
+    loadArtwork(artUrl).then(dataUrl => {
+      if (!dataUrl || mediaTrackUri !== cur.uri || !mediaMeta) return;
+      applyMediaMetadata(Object.assign({}, mediaMeta, {artwork: dataUrlArtwork(dataUrl)}));
+    });
+  }
+  // warm the cache for the track after this one
+  const nextTrack = ((st.track_window && st.track_window.next_tracks) || [])[0];
+  if (nextTrack) loadArtwork(pickArtworkUrl(nextTrack.album && nextTrack.album.images));
 }
 
 function updateMediaSession(np) {
