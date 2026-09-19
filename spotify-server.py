@@ -1039,86 +1039,6 @@ SPOTIFY_ICON = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <path d="M20 40 V24 M32 44 V16 M44 40 V28" fill="none" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
 </svg>'''
 
-# 512x512 lock-screen artwork: the same three bars as SPOTIFY_ICON, full-bleed on white
-# (iOS wants a PNG/JPEG, not SVG). Inlined as a data: URL so the lock screen needs no request.
-SPOTIFY_LOCK_ARTWORK_B64 = (
-    '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'
-    'Tm50eFSvFAAAAABJRU5ErkJggg=='
-)
 
 SPOTIFY_APPLE_ICON = base64.b64decode(
     'iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAAIEklEQVR4nO3dX0hT/x/H8bPj5sy5uRrmNCk1Yi2yIIKSrLsiIhhC'
@@ -1436,15 +1356,8 @@ function initSDK() {
     // background where the 5s setInterval is throttled: keep the lock screen current.
     player.addListener('player_state_changed', st => {
       const cur = st && st.track_window && st.track_window.current_track;
-      const prev = sdkPos;
       sdkPos = cur ? {uri: cur.uri, position: st.position, duration: st.duration, paused: st.paused, at: Date.now()} : null;
-      if (cur && cur.uri !== sdkTrackUri) {
-        onSdkTrackChange(cur, st);
-      } else if (cur && prev && prev.uri === cur.uri) {
-        // A seek (position off the expected line) or a resume restarts the iframe's audio too.
-        const expected = prev.position + (prev.paused ? 0 : Date.now() - prev.at);
-        if (Math.abs(st.position - expected) > 2500 || (prev.paused && !st.paused)) reclaimNowPlaying(cur.uri, st.paused);
-      }
+      if (cur) mediaTrackUri = cur.uri;
       sdkTrackUri = cur ? cur.uri : null;
       updateMediaPosition();
       clearTimeout(playerStateTimer);
@@ -2366,21 +2279,11 @@ async function seekToMs(position_ms) {
   if (npState) { npState.progressMs = position_ms; npState.at = Date.now(); }
   if (sdkPos && sdkPos.uri === mediaTrackUri) { sdkPos.position = position_ms; sdkPos.at = Date.now(); }
   updateMediaPosition();
-  if (mediaTrackUri) reclaimNowPlaying(mediaTrackUri, !(npState && npState.playing));
 }
 progressInput.addEventListener('change', async () => {
   try { await seekToMs(Math.round(Number(progressInput.value))); } finally { draggingProgress = false; }
 });
 
-// ---- page-owned silent audio ----
-// The Web Playback SDK plays inside its own cross-origin iframe ("Spotify
-// Embedded Player"), and iOS hands the lock screen's Now Playing to whichever
-// frame is actually making sound -- so the metadata set below is ignored and
-// the lock screen shows the iframe's generic title and no artwork. A silent,
-// looping element owned by *this* page makes the page the Now Playing app, and
-// also keeps iOS from suspending the page in the gap between two tracks.
-// Opt out with ?lockscreen=0 (remembered), back in with ?lockscreen=1, in case
-// a device pauses Spotify when a second audio element starts.
 // ?fastplay=0 (remembered, ?fastplay=1 undoes it): play/pause through V1 and the
 // Web API instead of straight through the SDK -- for comparing the two.
 const fastPlayEnabled = (() => {
@@ -2390,6 +2293,17 @@ const fastPlayEnabled = (() => {
     return localStorage.getItem('fastPlay') !== '0';
   } catch (e) { return true; }
 })();
+
+// ---- page-owned silent audio ----
+// The Web Playback SDK plays inside its own cross-origin iframe ("Spotify
+// Embedded Player"). A silent, looping element owned by *this* page makes the
+// page a media player as far as the OS is concerned: it keeps iOS from
+// suspending the page in the gap between two tracks and routes the lock-screen
+// buttons to the Media Session handlers below (i.e. through V1's queue).
+// It shows no artwork or title of its own -- nothing here tries to control what
+// the lock screen displays. Opt out with ?lockscreen=0 (remembered), back in
+// with ?lockscreen=1, in case a device pauses Spotify when a second audio
+// element starts.
 const lockAudioEnabled = (() => {
   try {
     const q = new URLSearchParams(location.search).get('lockscreen');
@@ -2462,10 +2376,10 @@ function lockAudioIdleSoon(immediately) {
 }
 
 // ---- Media Session (lock screen / control centre / headset buttons) ----
-// Tells the OS what is playing and routes its transport buttons through the
-// same functions as the on-page buttons, so they honour V1's queue. It also
-// marks the page as a media player, which is what gives iOS a reason to keep it
-// alive in the background. Best effort: each piece is optional per browser.
+// Routes the OS transport buttons through the same functions as the on-page
+// buttons, so they honour V1's queue, and reports the playback position so the
+// lock-screen progress bar tracks the real one. No metadata (title/artwork) is
+// set. Best effort: each piece is optional per browser.
 const hasMediaSession = 'mediaSession' in navigator && typeof MediaMetadata === 'function';
 let mediaTrackUri = null;
 
@@ -2487,62 +2401,6 @@ function updateMediaPosition() {
   } catch (e) {}
 }
 
-// The lock screen shows a fixed identity -- the page's logo and the name
-// "Spotify" -- rather than the current track. Every track change hands Now
-// Playing to the SDK iframe (generic title, no artwork), and nothing the page can
-// do without pausing the music wins it back reliably (tried: restarting the silent
-// element, rewriting the metadata, re-publishing the cover, a pause/resume), so
-// the metadata is written once and never changes.
-const LOCKSCREEN_META = {title: 'Spotify', artist: 'V1', album: '',
-  artwork: [{src: '__LOCK_ARTWORK__', sizes: '512x512', type: 'image/png'}]};
-let mediaMeta = null;
-
-function applyMediaMetadata(meta) {
-  if (!hasMediaSession) return;
-  mediaMeta = meta;
-  try { navigator.mediaSession.metadata = new MediaMetadata(meta); } catch (e) {}
-}
-
-// A seek, a resume or a new track restarts the SDK iframe's audio, and iOS gives
-// Now Playing to it. Restarting the silent element (so this page is the most
-// recent player again) and re-writing the metadata brings the logo back after a
-// seek/resume; on a track change it usually doesn't, which is accepted.
-let lastReclaimAt = 0;
-
-function restartLockAudio(uri) {
-  if (mediaTrackUri !== uri || !lockAudio || lockAudio.paused || (sdkPos && sdkPos.paused)) return;
-  lastReclaimAt = Date.now();
-  lockAudio.pause();
-  setTimeout(() => {
-    if (sdkPos && sdkPos.paused) return;    // the user paused meanwhile
-    lockAudioPlay();
-    if (mediaTrackUri === uri && mediaMeta) { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
-  }, 100);
-}
-
-// full: a new track. Nothing is paused/restarted while the track is switching
-// (touching the silent element right then made the change itself slower); once
-// it is really playing, restart the silent element once at 3s.
-function reclaimNowPlaying(uri, paused, full) {
-  if (!hasMediaSession) return;
-  if (mediaMeta) applyMediaMetadata(mediaMeta);
-  if (!full && lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri);
-  const later = full ? [[1500, 'write'], [3000, 'restart'], [8000, 'write']] : [[1500, 'write'], [5000, 'write']];
-  for (const [ms, what] of later) {
-    setTimeout(() => {
-      if (mediaTrackUri !== uri || !mediaMeta) return;   // a newer track took over
-      if (what === 'restart') restartLockAudio(uri);
-      else { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
-    }, ms);
-  }
-}
-
-function onSdkTrackChange(cur, st) {
-  if (!hasMediaSession) return;
-  mediaTrackUri = cur.uri;
-  reclaimNowPlaying(cur.uri, st.paused, true);
-}
-
 function updateMediaSession(np) {
   if (!hasMediaSession) return;
   try {
@@ -2553,7 +2411,6 @@ function updateMediaSession(np) {
       return;
     }
     mediaTrackUri = np.track.uri;
-    if (!mediaMeta) applyMediaMetadata(LOCKSCREEN_META);
     navigator.mediaSession.playbackState = np.playing ? 'playing' : 'paused';
     if (np.playing) lockAudioPlay(); else lockAudioIdleSoon(false);
     updateMediaPosition();
@@ -2571,7 +2428,6 @@ if (hasMediaSession) {
   for (const [action, handler] of Object.entries(mediaActions)) {
     try { navigator.mediaSession.setActionHandler(action, details => Promise.resolve(handler(details)).catch(() => {})); } catch (e) {}
   }
-  applyMediaMetadata(LOCKSCREEN_META);
 }
 
 function renderProgress() {
@@ -2617,7 +2473,6 @@ setInterval(renderProgress, 250);
 </body>
 </html>
 """
-SPOTIFY_PAGE = SPOTIFY_PAGE.replace("__LOCK_ARTWORK__", "data:image/png;base64," + SPOTIFY_LOCK_ARTWORK_B64)
 
 
 # ------------------------------------------------------------------ http --
