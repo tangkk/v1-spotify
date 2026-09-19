@@ -489,7 +489,7 @@ def fetch_album_meta(album_id, force=False):
     return album
 
 
-ARTIST_ALBUM_PAGES_MAX = 5   # cold-cache cost cap per artist+group: 5 requests, then permanently cached
+ARTIST_ALBUM_PAGES_MAX = 12  # cold-cache cost cap per artist+group (120 albums; a big catalogue's old albums sit deep), then permanently cached
 
 
 def artist_album_page(artist_id, album_type, offset):
