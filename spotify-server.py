@@ -2231,6 +2231,15 @@ document.getElementById('npNext').onclick = skipNext;
 // (lock-screen play/pause pass it so a stale button can't flip the wrong way).
 async function togglePlayPause(want) {
   await ensureAudioUnlocked();
+  // Fast path: this tab *is* the Spotify device, so the SDK already knows
+  // whether it is playing and can pause/resume it directly -- no V1 or
+  // Spotify Web API round trips (each ~0.3s, three in a row on the slow path
+  // below) before anything happens or the button changes.
+  if (state.player && state.deviceId) {
+    let st = null;
+    try { st = await state.player.getCurrentState(); } catch (e) {}
+    if (st && await toggleViaSdk(st, want)) return;
+  }
   const device_id = await ensureDevice();
   if (!device_id) return;
   const np = await api('/spotify-api/player/now-playing');
@@ -2248,6 +2257,34 @@ async function togglePlayPause(want) {
     await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   }
   pollNowPlaying();
+}
+// Returns true when handled locally. The button and progress bar switch
+// immediately; if the SDK hasn't actually changed state 2s later, the Web API
+// is asked to do it instead, so a wedged iframe can't leave the tab stuck.
+// The Web API's is_playing lags the SDK by a moment; for 3s after a local
+// toggle pollNowPlaying trusts the toggle so the button doesn't flip back.
+let localPlayIntent = null;
+async function toggleViaSdk(st, want) {
+  const playing = !st.paused;
+  const wantPlay = typeof want === 'boolean' ? want : !playing;
+  if (wantPlay === playing) return true;
+  setPlayButton(wantPlay);
+  localPlayIntent = {playing: wantPlay, until: Date.now() + 3000};
+  if (npState) npState = Object.assign({}, npState, {progressMs: st.position, at: Date.now(), playing: wantPlay});
+  try {
+    if (wantPlay) await state.player.resume(); else await state.player.pause();
+  } catch (e) { pollNowPlaying(); return false; }
+  setTimeout(async () => {
+    let now = null;
+    try { now = await state.player.getCurrentState(); } catch (e) {}
+    if (now && now.paused === !wantPlay) return;
+    try {
+      const body = JSON.stringify({device_id: state.deviceId});
+      await api('/spotify-api/player/' + (wantPlay ? 'play' : 'pause'), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body});
+    } catch (e) {}
+    pollNowPlaying();
+  }, 2000);
+  return true;
 }
 // Play/pause share one button; the glyph shows the action a click will take.
 const ICON_PLAY = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M6 3.5v13L16.5 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
@@ -2284,6 +2321,7 @@ let npState = null;
 async function pollNowPlaying() {
   try {
     const np = await api('/spotify-api/player/now-playing');
+    if (np.track && localPlayIntent && Date.now() < localPlayIntent.until) np.playing = localPlayIntent.playing;
     const bar = document.getElementById('nowplaying');
     if (!np.track) {
       // Only true when nothing has ever played this session (no server-side
