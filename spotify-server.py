@@ -466,37 +466,55 @@ def fetch_album_meta(album_id, force=False):
     return album
 
 
-def find_next_album_for_artist(artist_id, album_type, after_album_id):
-    """Bounded (a single Spotify request, not fetch_artist_albums's full
-    pagination) lookup used only by the lazy same-artist auto-continue
-    trigger, so one automatic background event costs at most one request
-    against the quota-limited artists/albums endpoint. Cached permanently
-    under its own key either way, separate from fetch_artist_albums's cache
-    (which covers the "album,single,compilation" combined groups a deliberate
-    artist-page visit fetches, not the single group this needs)."""
-    cache_key = f"artist_albums_page1:{artist_id}:{album_type}"
-    albums = cache_get(cache_key)
-    if albums is None:
-        page = spotify_api("GET", f"/artists/{artist_id}/albums",
-                            params={"include_groups": album_type, "limit": SPOTIFY_PAGE_LIMIT, "offset": 0})
-        items = page.get("items", [])
-        seen = set()
-        albums = []
-        for a in items:
+ARTIST_ALBUM_PAGES_MAX = 5   # cold-cache cost cap per artist+group: 5 requests, then permanently cached
+
+
+def artist_album_page(artist_id, album_type, offset):
+    """One page (SPOTIFY_PAGE_LIMIT) of an artist's albums for a single group,
+    cached permanently per page so the lazy walk below never repeats a request."""
+    cache_key = f"artist_albums_pg:{artist_id}:{album_type}:{offset}"
+    page = cache_get(cache_key)
+    if page is None:
+        raw = spotify_api("GET", f"/artists/{artist_id}/albums",
+                          params={"include_groups": album_type, "limit": SPOTIFY_PAGE_LIMIT, "offset": offset})
+        page = {"items": [{k: a.get(k) for k in ("id", "name", "album_type", "release_date")}
+                          for a in raw.get("items", [])],
+                "has_more": bool(raw.get("next"))}
+        cache_set(cache_key, page)
+    return page
+
+
+def find_next_album_for_artist(artist_id, album_type, after_album_id, after_release_date=None):
+    """The album that follows after_album_id when the artist's albums of this
+    group are read newest to oldest. Pages are pulled lazily (newest first, at
+    most ARTIST_ALBUM_PAGES_MAX) and cached permanently, so one automatic
+    background lookup costs a bounded number of quota-limited requests. If the
+    album isn't in the pages walked (e.g. an old album deep in a long
+    discography) falls back to the first album released before it."""
+    seen, ordered = set(), []
+    offset = 0
+    for _ in range(ARTIST_ALBUM_PAGES_MAX):
+        page = artist_album_page(artist_id, album_type, offset)
+        for a in page["items"]:
             key = (normalize_title(a.get("name", "")), a.get("release_date", ""))
             if key in seen:
                 continue
             seen.add(key)
-            albums.append(a)
-        cache_set(cache_key, albums)
-    ordered = sorted(albums, key=lambda a: a.get("release_date") or "", reverse=True)
-    ids = [a["id"] for a in ordered]
-    if after_album_id not in ids:
-        return None
-    pos = ids.index(after_album_id)
-    if pos + 1 >= len(ids):
-        return None
-    return ordered[pos + 1]
+            ordered.append(a)
+        ordered.sort(key=lambda a: a.get("release_date") or "", reverse=True)
+        ids = [a["id"] for a in ordered]
+        if after_album_id in ids:
+            pos = ids.index(after_album_id)
+            if pos + 1 < len(ordered):
+                return ordered[pos + 1]
+        elif after_release_date:
+            older = [a for a in ordered if (a.get("release_date") or "") < after_release_date]
+            if older:
+                return older[0]
+        if not page["has_more"]:
+            return None
+        offset += SPOTIFY_PAGE_LIMIT
+    return None
 
 
 def track_summary(t):
@@ -528,7 +546,11 @@ def track_summary(t):
 _queue_lock = threading.RLock()
 _driver_wake = threading.Event()
 QUEUE_PUSH_WINDOW_MS = 15000
-AUTO_CAP = 30
+DRIVER_MAX_NAP = 5.0
+AUTO_CAP = 30            # tracks in the auto section
+AUTO_SEEDS = 4           # last manual albums the mix draws from
+AUTO_CHUNK = 3           # tracks taken from a seed per round-robin turn
+AUTO_ALBUMS_PER_SEED = 3 # following albums a seed may spill into
 
 
 def load_queue():
@@ -563,57 +585,94 @@ def album_track_summaries(album, raw_tracks):
              "duration_ms": t.get("duration_ms", 0)} for t in raw_tracks if t.get("uri")]
 
 
-def compute_auto(anchor_album_id, anchor_uri, exclude):
-    """What follows the anchor track: the rest of its album, then the artist's
-    next albums (same group, newest to oldest), capped at AUTO_CAP."""
-    out = []
+def auto_stream(seed):
+    """Lazily yields what would follow a seed (album_id, uri): the rest of its
+    album, then the same artist's next albums (same group, newest to oldest)."""
+    album_id, uri = seed
     try:
-        album = fetch_album_meta(anchor_album_id)
-        tracks = fetch_album_tracks(anchor_album_id)
+        album = fetch_album_meta(album_id)
+        tracks = fetch_album_tracks(album_id)
         uris = [t.get("uri") for t in tracks]
-        start = uris.index(anchor_uri) + 1 if anchor_uri in uris else len(tracks)
-        out += album_track_summaries(album, tracks[start:])
+        start = uris.index(uri) + 1 if uri in uris else len(tracks)
+        yield from album_track_summaries(album, tracks[start:])
         artists = album.get("artists") or []
-        current = anchor_album_id
-        for _ in range(3):
-            if len(out) >= AUTO_CAP or not artists:
-                break
-            nxt = find_next_album_for_artist(artists[0]["id"], album.get("album_type", "album"), current)
+        current, current_date = album_id, album.get("release_date")
+        for _ in range(AUTO_ALBUMS_PER_SEED if artists else 0):
+            nxt = find_next_album_for_artist(artists[0]["id"], album.get("album_type", "album"),
+                                              current, current_date)
             if not nxt:
-                break
-            out += album_track_summaries(fetch_album_meta(nxt["id"]), fetch_album_tracks(nxt["id"]))
-            current = nxt["id"]
+                return
+            yield from album_track_summaries(fetch_album_meta(nxt["id"]), fetch_album_tracks(nxt["id"]))
+            current, current_date = nxt["id"], nxt.get("release_date")
     except SpotifyAPIError:
-        pass  # e.g. the artists/albums quota: keep what was found, don't fail the caller
-    return [t for t in out if t["uri"] not in exclude][:AUTO_CAP]
+        return  # e.g. the artists/albums quota: keep what was found, don't fail the caller
 
 
-def queue_anchor(q, fallback=None):
-    """(album_id, uri) of whatever plays last before the auto section."""
-    last = (q["manual"][-1] if q["manual"] else None) or q["next"]
-    if last:
-        return last.get("album_id"), last["uri"]
-    if fallback:
-        return fallback
-    item = (spotify_api("GET", "/me/player") or {}).get("item")
-    return ((item.get("album") or {}).get("id"), item["uri"]) if item else (None, None)
+def compute_auto(seeds, exclude):
+    """A mix of what follows each seed: round-robin, AUTO_CHUNK tracks at a
+    time, newest seed first, until AUTO_CAP tracks or every stream runs dry."""
+    streams = [auto_stream(seed) for seed in seeds]
+    seen, out = set(exclude), []
+    while streams and len(out) < AUTO_CAP:
+        for stream in list(streams):
+            taken = 0
+            for t in stream:
+                if t["uri"] in seen:
+                    continue
+                seen.add(t["uri"])
+                out.append(t)
+                taken += 1
+                if taken >= AUTO_CHUNK or len(out) >= AUTO_CAP:
+                    break
+            else:
+                streams.remove(stream)      # ran dry
+            if len(out) >= AUTO_CAP:
+                break
+    return out
+
+
+def queue_seeds(q, fallback=None):
+    """(album_id, uri) seeds for the auto section: the albums of the last few
+    manual tracks (newest first, one seed per album), then the locked next
+    track; with nothing queued, whatever is playing."""
+    seeds, albums = [], set()
+    for t in reversed(q["manual"]):
+        if t.get("album_id") and t["album_id"] not in albums and len(seeds) < AUTO_SEEDS:
+            albums.add(t["album_id"])
+            seeds.append((t["album_id"], t["uri"]))
+    n = q["next"]
+    if n and n.get("album_id") and n["album_id"] not in albums and len(seeds) < AUTO_SEEDS:
+        seeds.append((n["album_id"], n["uri"]))
+    if seeds:
+        return seeds
+    if fallback and fallback[0]:
+        return [fallback]
+    item = None
+    try:
+        item = (spotify_api("GET", "/me/player") or {}).get("item")
+    except SpotifyAPIError:
+        pass
+    if item and (item.get("album") or {}).get("id"):
+        return [(item["album"]["id"], item["uri"])]
+    last = (get_last_playback() or {}).get("track") or {}   # no active device: use the last known track
+    return [(last["album_id"], last["uri"])] if last.get("album_id") else []
 
 
 def refresh_auto(fallback_anchor=None):
-    """Rebuild the auto section: emptied while auto-continue is off, computed
-    from the anchor when it's on."""
+    """Rebuild the auto section: emptied while auto-continue is off, a mix
+    seeded from the queue's last manual tracks when it's on. Returns its length."""
     auto = []
     if get_autoplay():
         with _queue_lock:
             q = load_queue()
-        album_id, uri = queue_anchor(q, fallback_anchor)
-        if album_id:
-            exclude = {t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
-            auto = compute_auto(album_id, uri, exclude)
+        exclude = {t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
+        auto = compute_auto(queue_seeds(q, fallback_anchor), exclude)
     with _queue_lock:
         q = load_queue()
-        q["auto"] = auto
+        taken = {t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
+        q["auto"] = [t for t in auto if t["uri"] not in taken]   # the driver may have committed one meanwhile
         save_queue(q)
+        return len(q["auto"])
 
 
 def queue_add(track):
@@ -684,12 +743,60 @@ def start_track(track, device_id):
     spotify_api("PUT", "/me/player/play", params={"device_id": device_id}, body={"uris": [track["uri"]]})
 
 
+_driver_seen = None   # last observation of a playing track: {"uri", "at", "remaining_s"}
+
+
+def recover_ended_track(player, item, progress):
+    """The driver normally hands Spotify the next track during the last 15s, but
+    a seek, a short track or a slow tick can skip that window; a single-track
+    play then just stops. If the track we last saw playing has run its course
+    and playback has stopped at its start/end, start the next queued track here."""
+    global _driver_seen
+    seen = _driver_seen
+    if not seen or seen["uri"] != item["uri"]:
+        return False
+    ended = time.time() >= seen["at"] + seen["remaining_s"] - 2
+    at_edge = progress < 2000 or item.get("duration_ms", 0) - progress < 2000
+    if not (ended and at_edge):
+        return False
+    with _queue_lock:
+        q = load_queue()
+        idle = not (q["next"] or q["manual"] or q["auto"])
+    if idle and get_autoplay():
+        refresh_auto()
+    with _queue_lock:
+        q = load_queue()
+        kind = "next" if q["next"] else "manual" if q["manual"] else "auto" if q["auto"] else None
+        if not kind:
+            _driver_seen = None   # nothing to continue with: stop re-checking this stopped track
+            return False
+        head = q["next"] if kind == "next" else q[kind].pop(0)
+        if kind == "next":
+            q["next"] = None      # Spotify's queue lost it (or never got it): play it directly
+        save_queue(q)
+    try:
+        start_track(head, (player.get("device") or {}).get("id"))
+    except Exception:
+        with _queue_lock:
+            q = load_queue()
+            if kind == "next":
+                q["next"] = head
+            else:
+                q[kind].insert(0, head)
+            save_queue(q)
+        raise
+    _driver_seen = None
+    return True
+
+
 def queue_driver_tick():
     """One pass of the background driver; returns seconds until the next."""
+    global _driver_seen
     if load_account() is None:
         return 30
     q = load_queue()
     if not (q["next"] or q["manual"] or q["auto"] or get_autoplay()):
+        _driver_seen = None
         return 30
     player = spotify_api("GET", "/me/player") or {}
     item = player.get("item")
@@ -698,10 +805,14 @@ def queue_driver_tick():
     progress = player.get("progress_ms", 0)
     reconcile_queue(item["uri"], progress)
     if not player.get("is_playing"):
+        if recover_ended_track(player, item, progress):
+            return 2
         return 15
     remaining = item.get("duration_ms", 0) - progress
+    _driver_seen = {"uri": item["uri"], "at": time.time(), "remaining_s": remaining / 1000}
     if remaining > QUEUE_PUSH_WINDOW_MS:
-        return min(20.0, max(1.0, (remaining - QUEUE_PUSH_WINDOW_MS) / 1000 - 1))
+        # short naps: a seek towards the end can bring the window forward at any moment
+        return min(DRIVER_MAX_NAP, max(1.0, (remaining - QUEUE_PUSH_WINDOW_MS) / 1000 - 1))
     q = load_queue()
     if not q["next"]:
         if get_autoplay() and not q["manual"] and not q["auto"] and q["auto_tried"] != item["uri"]:
@@ -718,7 +829,7 @@ def queue_driver_tick():
             except Exception:
                 queue_uncommit(head, kind)
                 raise
-    return max(1.0, min(20.0, remaining / 1000 + 1.5))
+    return max(1.0, min(DRIVER_MAX_NAP, remaining / 1000 + 1.5))
 
 
 def queue_driver_loop():
@@ -1362,7 +1473,9 @@ function renderQueueView(q) {
       const r = await api('/spotify-api/queue-settings', {method: 'PUT', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({autoplay: !state.autoplay})});
       state.autoplay = r.autoplay;
-      showToast(r.autoplay ? 'Auto up next on' : 'Auto up next off');
+      state.autoplayLockUntil = Date.now() + 10000;   // a poll already in flight carries the old value
+      showToast(!r.autoplay ? 'Auto up next off'
+        : r.auto_count ? 'Auto up next on · ' + r.auto_count + ' tracks queued' : 'Auto up next on · nothing to add yet');
     } catch (err) { showToast('Could not change: ' + err.message); }
     loadQueueView();
   };
@@ -1924,7 +2037,7 @@ async function pollNowPlaying() {
     document.getElementById('npSub').textContent = np.track.artists.join(', ') + ' · ' + (np.device || '');
     document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
-    state.autoplay = !!np.autoplay;
+    if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
@@ -2310,9 +2423,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_set_autoplay(self, body):
         set_autoplay(bool(body.get("autoplay")))
-        refresh_auto()
+        try:
+            auto_count = refresh_auto()
+        except Exception as exc:     # the flag is already saved; the driver retries when it needs the auto section
+            print(f"queue-settings: refresh_auto failed: {exc}", flush=True)
+            auto_count = len(load_queue()["auto"])
         _driver_wake.set()
-        self.send_json(200, {"ok": True, "autoplay": get_autoplay()})
+        self.send_json(200, {"ok": True, "autoplay": get_autoplay(), "auto_count": auto_count})
 
     def handle_queue_play_track(self, body):
         track = clean_track(body.get("track"))
@@ -2427,10 +2544,12 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("position_ms") is not None:
                 payload["position_ms"] = body["position_ms"]
             spotify_api("PUT", "/me/player/play", params={"device_id": device_id}, body=payload or None)
+            _driver_wake.set()
             self.send_json(200, {"ok": True}); return
         if path == "/spotify-api/player/pause":
             body = self.read_json_body()
             spotify_api("PUT", "/me/player/pause", params={"device_id": body.get("device_id")})
+            _driver_wake.set()
             self.send_json(200, {"ok": True}); return
         if path == "/spotify-api/player/volume":
             value = query.get("value", [None])[0]
@@ -2453,6 +2572,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_json(400, {"error": "invalid_position_ms"}); return
             spotify_api("PUT", "/me/player/seek", params={"position_ms": position_ms, "device_id": device_id})
+            _driver_wake.set()
             self.send_json(200, {"ok": True}); return
         if path == "/spotify-api/view-state":
             body = self.read_json_body()
