@@ -42,7 +42,9 @@ Routes:
   POST /spotify-api/queue/add         {"track"} -- manual add (promotes it if it was in the auto section)
   POST /spotify-api/queue/remove      {"list": "manual"|"auto", "index", "uri"}
   POST /spotify-api/queue/play-track  {"track", "device_id"} -- play now; album remainder becomes auto (when on)
-  POST /spotify-api/queue/play-album  {"album_id", "device_id"} -- play now; rest of the album becomes manual
+  POST /spotify-api/queue/play-album  {"album_id", "device_id"} -- play now; the rest of the album becomes the whole (manual) queue, replacing the old one
+  POST /spotify-api/queue/play-albums {"album_ids": [...], "device_id"} -- same for a list of albums in that order (one long queue, capped at PLAY_ALBUMS_MAX_TRACKS)
+  POST /spotify-api/queue/clear       -- empty the manual and auto sections (the track already handed to Spotify stays: Spotify can't take it back)
   POST /spotify-api/queue/next        {"device_id"} -- play the queue head (else Spotify's own next)
   PUT  /spotify-api/queue-settings    {"autoplay": bool} -- off drops the auto section, on recomputes it
   GET  /spotify-api/view-state        -> {"view": {...}|null, "updated_at", "updated_by"}
@@ -322,6 +324,19 @@ def is_favorite(album_id):
     return row is not None
 
 
+def favorite_track_summaries(album_id):
+    """Queue-item track summaries for a favorited album whose tracks are cached
+    in the favorites table -- no Spotify calls -- or None."""
+    with db() as conn:
+        row = conn.execute("SELECT name, image, tracks FROM favorite_albums WHERE id=?", (album_id,)).fetchone()
+    if not row or not row[2]:
+        return None
+    return [{"id": t.get("id"), "uri": t["uri"], "name": t.get("name", ""), "image": row[1],
+             "artists": [str(a) for a in (t.get("artists") or [])],
+             "album_id": album_id, "album_name": row[0], "duration_ms": int(t.get("duration_ms") or 0)}
+            for t in json.loads(row[2]) if t.get("uri")]
+
+
 def get_favorite_album_detail(album_id):
     """Cached full album+tracks for a favorited album, or None if it isn't
     favorited or hasn't been cached yet (favorited before this existed)."""
@@ -489,6 +504,8 @@ def fetch_album_meta(album_id, force=False):
     return album
 
 
+PLAY_ALBUMS_MAX_ALBUMS = 300   # albums per "play these" request
+PLAY_ALBUMS_MAX_TRACKS = 1000  # the whole list is stored in the queue row; this keeps it (and every poll that reads it) small
 ARTIST_ALBUM_PAGES_MAX = 12  # cold-cache cost cap per artist+group (120 albums; a big catalogue's old albums sit deep), then permanently cached
 
 
@@ -1272,6 +1289,10 @@ function iconButton(svg, title, cls) {
 }
 
 const ICON_PLUS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+// Arrow pointing up = ascending (smallest first), down = descending.
+const ICON_SORT_ASC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16V4M5 9l5-5 5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ICON_SORT_DESC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 4v12M5 11l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ICON_TRASH = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M4 5.5h12M8 5.5V3.5h4v2M5.5 5.5l.8 11h7.4l.8-11M8.5 9v4.5M11.5 9v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 
 // Row action buttons (play / add to queue / remove) are the same 38px icon
@@ -1465,6 +1486,21 @@ async function playAlbumNow(albumId) {
   pollNowPlaying();
 }
 
+// Plays a list of albums in the order given as one long queue: the first track
+// now, everything after it (the rest of that album, then the following albums)
+// as the manual queue.
+async function playAlbumsNow(albumIds) {
+  await ensureAudioUnlocked();
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  try {
+    const r = await api('/spotify-api/queue/play-albums', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({album_ids: albumIds, device_id})});
+    showToast(r.tracks + ' tracks from ' + r.albums + ' albums queued' + (r.truncated ? ' (first ' + r.tracks + ' only)' : ''));
+  } catch (err) { showToast('Could not play: ' + err.message); }
+  pollNowPlaying();
+}
+
 // ---- navigation ----
 // A small back-stack of view descriptors ({type, ...ids}) drives both the
 // in-app Back button and cross-device sync: whichever device navigates writes
@@ -1594,7 +1630,6 @@ function renderQueueView(q) {
   heading.appendChild(upNext);
   const autoBtn = iconButton('<svg width="16" height="16" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.3 6.8L13.2 10l-4.9 3.2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
     'Auto up next', 'icon-btn');
-  autoBtn.style.width = '32px'; autoBtn.style.height = '32px';
   autoBtn.classList.toggle('active', state.autoplay);
   autoBtn.title = state.autoplay ? 'Auto up next: on' : 'Auto up next: off';
   autoBtn.onclick = async () => {
@@ -1610,6 +1645,17 @@ function renderQueueView(q) {
     loadQueueView();
   };
   heading.appendChild(autoBtn);
+  const clearBtn = iconButton(ICON_TRASH, 'Clear queue');
+  clearBtn.onclick = async () => {
+    if (!confirm('Clear the whole queue (manual and auto)?')) return;
+    clearBtn.disabled = true;
+    try {
+      await api('/spotify-api/queue/clear', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      showToast('Queue cleared');
+    } catch (err) { showToast('Could not clear: ' + err.message); }
+    loadQueueView();
+  };
+  heading.appendChild(clearBtn);
   view.appendChild(heading);
 
   const list = el('ul', 'list');
@@ -1637,20 +1683,29 @@ function eraOf(releaseDate) {
 let favoritesState = null;
 let favoritesFilter = {artist: '', genre: '', era: ''};
 
-// Sort order is a preference, not a filter: it survives reloading the list and
-// is remembered per browser.
+// Sort order and its direction are preferences, not filters: they survive
+// reloading the list and are remembered per browser. Each order keeps its own
+// direction; the defaults are newest first for Year / Recently added and A to Z.
 const FAV_ORDERS = [['year', 'Order: Year'], ['added', 'Order: Recently added'], ['alpha', 'Order: A–Z']];
+const FAV_DEFAULT_DIRS = {year: 'desc', added: 'desc', alpha: 'asc'};
 let favoritesOrder = 'year';
-try { const o = localStorage.getItem('spotify_fav_order'); if (FAV_ORDERS.some(x => x[0] === o)) favoritesOrder = o; } catch (e) {}
+let favoritesDirs = Object.assign({}, FAV_DEFAULT_DIRS);
+try {
+  const o = localStorage.getItem('spotify_fav_order'); if (FAV_ORDERS.some(x => x[0] === o)) favoritesOrder = o;
+  const d = JSON.parse(localStorage.getItem('spotify_fav_dirs') || '{}');
+  for (const k of Object.keys(FAV_DEFAULT_DIRS)) if (d[k] === 'asc' || d[k] === 'desc') favoritesDirs[k] = d[k];
+} catch (e) {}
 
-// Year: newest first, exact release date as the tie-break; albums with no date go last.
-function sortFavorites(items, order) {
+// asc = smallest first: oldest year / oldest added / A to Z. Ties fall back to
+// the name (always A to Z); albums with no release date always go last.
+function sortFavorites(items, order, dir) {
+  const sign = dir === 'asc' ? 1 : -1;
   const byName = (a, b) => (a.name || '').localeCompare(b.name || '', undefined, {sensitivity: 'base'});
   const cmp = {
-    alpha: byName,
-    added: (a, b) => (b.added_at || 0) - (a.added_at || 0) || byName(a, b),
-    year: (a, b) => (a.release_date ? 0 : 1) - (b.release_date ? 0 : 1)
-      || (b.release_date || '').localeCompare(a.release_date || '') || byName(a, b),
+    alpha: (a, b) => sign * byName(a, b),
+    added: (a, b) => sign * ((a.added_at || 0) - (b.added_at || 0)) || byName(a, b),
+    year: (a, b) => (!a.release_date - !b.release_date)
+      || sign * (a.release_date || '').localeCompare(b.release_date || '') || byName(a, b),
   }[order];
   return items.slice().sort(cmp);
 }
@@ -1708,9 +1763,18 @@ function renderFavoritesView() {
     try { localStorage.setItem('spotify_fav_order', v); } catch (e) {}
     renderFavoritesView();
   }));
+  const dir = favoritesDirs[favoritesOrder];
+  const dirBtn = iconButton(dir === 'asc' ? ICON_SORT_ASC : ICON_SORT_DESC,
+    dir === 'asc' ? 'Ascending (click for descending)' : 'Descending (click for ascending)');
+  dirBtn.onclick = () => {
+    favoritesDirs[favoritesOrder] = dir === 'asc' ? 'desc' : 'asc';
+    try { localStorage.setItem('spotify_fav_dirs', JSON.stringify(favoritesDirs)); } catch (e) {}
+    renderFavoritesView();
+  };
+  filterRow.appendChild(dirBtn);
   view.appendChild(filterRow);
 
-  const filtered = sortFavorites(favoritesState, favoritesOrder).filter(a => {
+  const filtered = sortFavorites(favoritesState, favoritesOrder, favoritesDirs[favoritesOrder]).filter(a => {
     if (favoritesFilter.artist && !(a.artists || []).includes(favoritesFilter.artist)) return false;
     const genres = a.genres || [];
     if (favoritesFilter.genre === UNTAGGED && genres.length) return false;
@@ -1720,6 +1784,13 @@ function renderFavoritesView() {
     if (favoritesFilter.era && favoritesFilter.era !== UNKNOWN_ERA && era !== favoritesFilter.era) return false;
     return true;
   });
+
+  if (filtered.length) {
+    // Plays what is listed below, in the order it is listed (current filters and sort).
+    const playBtn = iconButton(ICON_PLAY, 'Play these ' + filtered.length + ' albums in this order', 'icon-btn active');
+    playBtn.onclick = () => playAlbumsNow(filtered.map(a => a.id));
+    filterRow.appendChild(playBtn);
+  }
 
   const list = el('ul', 'list');
   if (!filtered.length) {
@@ -2861,11 +2932,60 @@ class Handler(BaseHTTPRequestHandler):
         start_track(tracks[0], body.get("device_id"))
         with _queue_lock:
             q = load_queue()
-            q["manual"] = tracks[1:] + q["manual"]   # asked for the whole album, so its tracks are manual
+            q["manual"] = tracks[1:]   # a new queue: replaces the old manual and auto sections
+            q["auto"] = []
             q["auto_tried"] = None
             save_queue(q)
         refresh_auto((album_id, tracks[-1]["uri"]))
         _driver_wake.set()
+        self.send_json(200, {"ok": True})
+
+    def handle_queue_play_albums(self, body):
+        ids = body.get("album_ids")
+        if (not isinstance(ids, list) or not ids or len(ids) > PLAY_ALBUMS_MAX_ALBUMS
+                or not all(isinstance(i, str) and re.fullmatch(r"[A-Za-z0-9]{10,40}", i) for i in ids)):
+            self.send_json(400, {"error": "invalid_albums"}); return
+        tracks, albums, truncated = [], 0, False
+        for album_id in dict.fromkeys(ids):          # in the order given, each album once
+            if len(tracks) >= PLAY_ALBUMS_MAX_TRACKS:
+                truncated = True                     # albums remain that don't fit
+                break
+            album_tracks = favorite_track_summaries(album_id)
+            if album_tracks is None:                 # favorited before tracks were cached: ask Spotify (cached from then on)
+                try:
+                    album_tracks = album_track_summaries(fetch_album_meta(album_id), fetch_album_tracks(album_id))
+                except Exception:
+                    album_tracks = []
+            if album_tracks:
+                tracks.extend(album_tracks)
+                albums += 1
+        truncated = truncated or len(tracks) > PLAY_ALBUMS_MAX_TRACKS
+        tracks = tracks[:PLAY_ALBUMS_MAX_TRACKS]
+        if not tracks:
+            self.send_json(404, {"error": "empty_albums"}); return
+        start_track(tracks[0], body.get("device_id"))
+        with _queue_lock:
+            q = load_queue()
+            q["manual"] = tracks[1:]   # like play-album: a new queue, replacing the old manual and auto sections
+            q["auto"] = []
+            q["auto_tried"] = None
+            save_queue(q)
+        refresh_auto((tracks[-1]["album_id"], tracks[-1]["uri"]))
+        _driver_wake.set()
+        self.send_json(200, {"ok": True, "tracks": len(tracks), "albums": albums, "truncated": truncated})
+
+    def handle_queue_clear(self, body):
+        with _queue_lock:
+            q = load_queue()
+            q["manual"] = []
+            q["auto"] = []
+            # Don't refill straight away: mark what's playing as already handled
+            # for both the top-up and the "queue ran dry" refresh.
+            current = ((get_last_playback() or {}).get("track") or {}).get("uri")
+            q["auto_tried"] = current
+            save_queue(q)
+        global _topup_key
+        _topup_key = current
         self.send_json(200, {"ok": True})
 
     def handle_queue_next(self, body):
@@ -3034,6 +3154,8 @@ class Handler(BaseHTTPRequestHandler):
                   "/spotify-api/queue/remove": self.handle_queue_remove,
                   "/spotify-api/queue/play-track": self.handle_queue_play_track,
                   "/spotify-api/queue/play-album": self.handle_queue_play_album,
+                  "/spotify-api/queue/play-albums": self.handle_queue_play_albums,
+                  "/spotify-api/queue/clear": self.handle_queue_clear,
                   "/spotify-api/queue/next": self.handle_queue_next}
         if path in routes:
             routes[path](self.read_json_body()); return
