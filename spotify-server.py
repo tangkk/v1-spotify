@@ -1217,6 +1217,7 @@ let sdkConnectTriggered = false;
 let sdkPlayerReady = false;
 let sdkPlayerWaiters = [];
 let deviceReadyWaiters = [];
+let playerStateTimer = null;
 
 function initSDK() {
   window.onSpotifyWebPlaybackSDKReady = () => {
@@ -1235,6 +1236,12 @@ function initSDK() {
       deviceReadyWaiters = [];
     });
     player.addListener('not_ready', () => { state.deviceId = null; });
+    // Fires on every track change/pause/seek, including with the page in the
+    // background where the 5s setInterval is throttled: keep the lock screen current.
+    player.addListener('player_state_changed', () => {
+      clearTimeout(playerStateTimer);
+      playerStateTimer = setTimeout(pollNowPlaying, 300);
+    });
     player.addListener('initialization_error', ({message}) => console.error('spotify init error', message));
     player.addListener('authentication_error', ({message}) => console.error('spotify auth error', message));
     player.addListener('account_error', ({message}) => console.error('spotify account error (Premium required)', message));
@@ -1959,25 +1966,30 @@ async function renderAlbumView(album) {
 
 // ---- now playing / transport ----
 
-document.getElementById('npPrev').onclick = async () => {
+async function skipPrevious() {
   await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   await api('/spotify-api/player/previous', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
-};
-document.getElementById('npNext').onclick = async () => {
+}
+async function skipNext() {
   await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   await api('/spotify-api/queue/next', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   pollNowPlaying();
-};
-async function togglePlayPause() {
+}
+document.getElementById('npPrev').onclick = skipPrevious;
+document.getElementById('npNext').onclick = skipNext;
+// want: true = make sure it plays, false = make sure it pauses, omitted = toggle
+// (lock-screen play/pause pass it so a stale button can't flip the wrong way).
+async function togglePlayPause(want) {
   await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   const np = await api('/spotify-api/player/now-playing');
+  if (typeof want === 'boolean' && !!np.playing === want) return;
   if (np.playing) {
     await api('/spotify-api/player/pause', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
   } else if (np.live === false && np.track) {
@@ -1992,7 +2004,7 @@ async function togglePlayPause() {
   }
   pollNowPlaying();
 }
-document.getElementById('npPlay').onclick = togglePlayPause;
+document.getElementById('npPlay').onclick = () => togglePlayPause();
 
 // Spacebar play/pause, except while actually typing (a text input/textarea
 // focused, or a button mid-activation via a real space keypress on it).
@@ -2024,6 +2036,7 @@ async function pollNowPlaying() {
       // always returns that last snapshot instead of an empty track.
       bar.style.display = 'none';
       npState = null;
+      updateMediaSession(null);
       return;
     }
     bar.style.display = 'flex';
@@ -2038,6 +2051,7 @@ async function pollNowPlaying() {
     document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
     if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
+    updateMediaSession(np);
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
@@ -2051,14 +2065,67 @@ progressInput.addEventListener('input', () => {
   draggingProgress = true;
   document.getElementById('npElapsed').textContent = fmtDuration(Number(progressInput.value));
 });
-progressInput.addEventListener('change', async () => {
-  const position_ms = Math.round(Number(progressInput.value));
+async function seekToMs(position_ms) {
   const device_id = await ensureDevice();
-  draggingProgress = false;
   if (!device_id) return;
   await api('/spotify-api/player/seek?position_ms=' + position_ms + '&device_id=' + encodeURIComponent(device_id), {method: 'PUT'});
   if (npState) { npState.progressMs = position_ms; npState.at = Date.now(); }
+  updateMediaPosition();
+}
+progressInput.addEventListener('change', async () => {
+  try { await seekToMs(Math.round(Number(progressInput.value))); } finally { draggingProgress = false; }
 });
+
+// ---- Media Session (lock screen / control centre / headset buttons) ----
+// Tells the OS what is playing and routes its transport buttons through the
+// same functions as the on-page buttons, so they honour V1's queue. It also
+// marks the page as a media player, which is what gives iOS a reason to keep it
+// alive in the background. Best effort: each piece is optional per browser.
+const hasMediaSession = 'mediaSession' in navigator && typeof MediaMetadata === 'function';
+let mediaTrackUri = null;
+
+function updateMediaPosition() {
+  if (!hasMediaSession || !npState || !npState.durationMs || !navigator.mediaSession.setPositionState) return;
+  try {
+    const duration = npState.durationMs / 1000;
+    const position = (npState.progressMs + (npState.playing ? Date.now() - npState.at : 0)) / 1000;
+    navigator.mediaSession.setPositionState({duration, playbackRate: 1, position: Math.max(0, Math.min(position, duration))});
+  } catch (e) {}
+}
+
+function updateMediaSession(np) {
+  if (!hasMediaSession) return;
+  try {
+    if (!np || !np.track) {
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = 'none';
+      mediaTrackUri = null;
+      return;
+    }
+    if (np.track.uri !== mediaTrackUri) {   // only on track change, so the artwork isn't reloaded every poll
+      mediaTrackUri = np.track.uri;
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: np.track.name || '', artist: (np.track.artists || []).join(', '), album: np.track.album || '',
+        artwork: np.track.image ? [{src: np.track.image, sizes: '640x640', type: 'image/jpeg'}] : [],
+      });
+    }
+    navigator.mediaSession.playbackState = np.playing ? 'playing' : 'paused';
+    updateMediaPosition();
+  } catch (e) {}
+}
+
+if (hasMediaSession) {
+  const mediaActions = {
+    play: () => togglePlayPause(true),
+    pause: () => togglePlayPause(false),
+    previoustrack: skipPrevious,
+    nexttrack: skipNext,
+    seekto: details => seekToMs(Math.round((details.seekTime || 0) * 1000)),
+  };
+  for (const [action, handler] of Object.entries(mediaActions)) {
+    try { navigator.mediaSession.setActionHandler(action, details => Promise.resolve(handler(details)).catch(() => {})); } catch (e) {}
+  }
+}
 
 function renderProgress() {
   const elapsedEl = document.getElementById('npElapsed');
