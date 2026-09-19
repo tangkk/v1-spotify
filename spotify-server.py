@@ -2235,7 +2235,7 @@ async function togglePlayPause(want) {
   // whether it is playing and can pause/resume it directly -- no V1 or
   // Spotify Web API round trips (each ~0.3s, three in a row on the slow path
   // below) before anything happens or the button changes.
-  if (state.player && state.deviceId) {
+  if (fastPlayEnabled && state.player && state.deviceId) {
     let st = null;
     try { st = await state.player.getCurrentState(); } catch (e) {}
     if (st && await toggleViaSdk(st, want)) return;
@@ -2381,6 +2381,15 @@ progressInput.addEventListener('change', async () => {
 // also keeps iOS from suspending the page in the gap between two tracks.
 // Opt out with ?lockscreen=0 (remembered), back in with ?lockscreen=1, in case
 // a device pauses Spotify when a second audio element starts.
+// ?fastplay=0 (remembered, ?fastplay=1 undoes it): play/pause through V1 and the
+// Web API instead of straight through the SDK -- for comparing the two.
+const fastPlayEnabled = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('fastplay');
+    if (q !== null) localStorage.setItem('fastPlay', q);
+    return localStorage.getItem('fastPlay') !== '0';
+  } catch (e) { return true; }
+})();
 const lockAudioEnabled = (() => {
   try {
     const q = new URLSearchParams(location.search).get('lockscreen');
@@ -2423,11 +2432,16 @@ function getLockAudio() {
   return lockAudio;
 }
 
-// Called at the top of every transport click: a play()/pause() inside a user
-// gesture is what lets the element be started later without one.
+// Called at the top of every transport click until the element has played once:
+// a play()/pause() inside a user gesture is what lets the element be started
+// later without one. After that it is skipped -- this play()+pause() flick used
+// to run on every click while the element was idle, which is right when a
+// resume now starts (no network wait in between any more), and audible as a
+// hiccup at the start of playback.
+let lockAudioUnlocked = false;
 function unlockLockAudio() {
   const a = getLockAudio();
-  if (!a || !a.paused) return;
+  if (!a || lockAudioUnlocked || !a.paused) return;
   a.play().catch(() => {});
   a.pause();
 }
@@ -2435,7 +2449,7 @@ function unlockLockAudio() {
 function lockAudioPlay() {
   clearTimeout(lockAudioIdleTimer); lockAudioIdleTimer = null;
   const a = getLockAudio();
-  if (a && a.paused) a.play().catch(() => {});
+  if (a && a.paused) a.play().then(() => { lockAudioUnlocked = true; }, () => {});
 }
 
 // Paused Spotify keeps the silent audio going for a moment: the gap between two
