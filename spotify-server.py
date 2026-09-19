@@ -2209,18 +2209,32 @@ function applyMediaMetadata(meta) {
 // re-write the metadata now and a bit later, in case iOS updated after us.
 let reclaimSeq = 0, lastReclaimAt = 0;
 
-function reclaimNowPlaying(uri, paused) {
+// Restart the silent element (and re-publish the metadata after it): what makes
+// iOS show this page again once the iframe's audio is really making sound.
+function restartLockAudio(uri, seq) {
+  if (seq !== reclaimSeq || mediaTrackUri !== uri || !lockAudio || lockAudio.paused || (sdkPos && sdkPos.paused)) return;
+  lastReclaimAt = Date.now();
+  lockAudio.pause();
+  setTimeout(() => {
+    if (sdkPos && sdkPos.paused) return;    // the user paused meanwhile
+    lockAudioPlay();
+    if (seq === reclaimSeq && mediaMeta) { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
+  }, 100);
+}
+
+// full: a new track. Its SDK event fires when the track starts *loading*, well
+// before the iframe really plays and iOS switches Now Playing back to it, so a
+// single restart at the event is too early: restart again at 1.5s and 4s.
+function reclaimNowPlaying(uri, paused, full) {
   if (!hasMediaSession) return;
   const seq = ++reclaimSeq;
   if (mediaMeta) applyMediaMetadata(mediaMeta);
-  if (lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) {
-    lastReclaimAt = Date.now();
-    lockAudio.pause();
-    setTimeout(() => { if (!(sdkPos && sdkPos.paused)) lockAudioPlay(); }, 100);   // unless the user paused meanwhile
-  }
-  for (const ms of [1500, 5000]) {
+  if (lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri, seq);
+  const later = full ? [[1500, true], [4000, true], [8000, false]] : [[1500, false], [5000, false]];
+  for (const [ms, restart] of later) {
     setTimeout(() => {
       if (seq !== reclaimSeq || mediaTrackUri !== uri || !mediaMeta) return;   // a newer reclaim/track took over
+      if (restart) { restartLockAudio(uri, seq); return; }
       applyMediaMetadata(mediaMeta);
       updateMediaPosition();
     }, ms);
@@ -2237,7 +2251,7 @@ function onSdkTrackChange(cur, st) {
     title: cur.name || '', artist: (cur.artists || []).map(a => a.name).join(', '), album: (cur.album && cur.album.name) || '',
     artwork: images.map(i => ({src: i.url, sizes: (i.width || 640) + 'x' + (i.height || 640), type: 'image/jpeg'})),
   });
-  reclaimNowPlaying(cur.uri, st.paused);
+  reclaimNowPlaying(cur.uri, st.paused, true);
 }
 
 function updateMediaSession(np) {
