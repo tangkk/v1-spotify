@@ -42,6 +42,8 @@ Routes:
   POST /spotify-api/player/next       {"device_id"}
   POST /spotify-api/player/previous   {"device_id"}
   POST /spotify-api/player/queue      {"uri", "device_id"} -- append without interrupting current playback
+  POST /spotify-api/player/queue/remove {"index", "uri"} -- drop one queued item (rebuilds playback from the current position)
+  PUT  /spotify-api/queue-settings    {"autoplay": bool} -- false clears every queued item that wasn't added by hand
   GET  /spotify-api/view-state        -> {"view": {...}|null, "updated_at", "updated_by"}
   PUT  /spotify-api/view-state        {"view": {...}, "client_id": "..."} -- cross-device "what's on screen" sync
   GET    /spotify-api/favorites            -> {"items": [{id, name, artists, image, release_date, genres, added_at}]}
@@ -180,7 +182,55 @@ def db():
         payload TEXT NOT NULL,
         cached_at INTEGER NOT NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS manual_queue (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        uri TEXT NOT NULL,
+        added_at INTEGER NOT NULL
+    )""")
     return conn
+
+
+# Spotify's Web API can add to the queue but has no "remove from queue" /
+# "clear queue" endpoint, and doesn't say which queued tracks were added by
+# hand vs. auto-continued from the playing context. So V1 remembers which
+# tracks the user added with "+" (manual_queue, in the order added), and the
+# autoplay flag below; queue edits are then done by re-issuing playback as
+# [current track] + [tracks to keep] from the current position (rebuild_play).
+def get_autoplay():
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key='autoplay'").fetchone()
+    return row is None or row[0] != "0"
+
+
+def set_autoplay(enabled):
+    with db() as conn:
+        conn.execute("""INSERT INTO app_settings(key, value) VALUES ('autoplay', ?)
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value""", ("1" if enabled else "0",))
+        conn.commit()
+
+
+def manual_add(uri):
+    with db() as conn:
+        conn.execute("INSERT INTO manual_queue(uri, added_at) VALUES (?, ?)", (uri, int(time.time())))
+        conn.commit()
+
+
+def manual_list():
+    with db() as conn:
+        rows = conn.execute("SELECT uri FROM manual_queue ORDER BY seq").fetchall()
+    return [r[0] for r in rows]
+
+
+def manual_replace(uris):
+    with db() as conn:
+        conn.execute("DELETE FROM manual_queue")
+        now = int(time.time())
+        conn.executemany("INSERT INTO manual_queue(uri, added_at) VALUES (?, ?)", [(u, now) for u in uris])
+        conn.commit()
 
 
 # Permanent (no expiration) cache for the artist/album/track catalog data
@@ -494,6 +544,48 @@ def track_summary(t):
             "duration_ms": t.get("duration_ms", 0)}
 
 
+def fetch_queue_items():
+    """(currently_playing, [raw queued track dicts]) from Spotify."""
+    result = spotify_api("GET", "/me/player/queue")
+    current = result.get("currently_playing")
+    items = [t for t in result.get("queue", []) if t]
+    # Spotify sometimes repeats the currently playing track as queue[0].
+    if current and items and items[0].get("uri") == current.get("uri"):
+        items = items[1:]
+    return current, items
+
+
+def manual_flags(items):
+    """Which queued items were added by hand: match them, in queue order,
+    against V1's own record of "+" adds (a track that's also part of the
+    playing context is treated as manual if the user added it)."""
+    pending = manual_list()
+    flags = []
+    for t in items:
+        if t.get("uri") in pending:
+            pending.remove(t["uri"])
+            flags.append(True)
+        else:
+            flags.append(False)
+    return flags
+
+
+def rebuild_play(tail_uris):
+    """Re-issue playback as [current track] + tail_uris at the current
+    position -- the only way to drop items from Spotify's queue. Keeps the
+    paused/playing state. Returns False if nothing is actively playing."""
+    player = spotify_api("GET", "/me/player") or {}
+    item = player.get("item")
+    device_id = (player.get("device") or {}).get("id")
+    if not item or not device_id:
+        return False
+    spotify_api("PUT", "/me/player/play", params={"device_id": device_id},
+                body={"uris": [item["uri"]] + tail_uris[:99], "position_ms": player.get("progress_ms", 0)})
+    if not player.get("is_playing"):
+        spotify_api("PUT", "/me/player/pause", params={"device_id": device_id})
+    return True
+
+
 def fetch_album_tracks(album_id, limit_total=300, force=False):
     cache_key = f"album_tracks:{album_id}"
     cached = None if force else cache_get(cache_key)
@@ -798,6 +890,7 @@ const state = {
   player: null,
   clientId: getClientId(),
   albumQueue: null, // {ids: [albumId, ...], pos: index} -- drives auto-advance to the next album
+  autoplay: true,   // queue-page toggle; mirrored from the server on every now-playing poll
 };
 
 function api(path, opts) {
@@ -952,6 +1045,9 @@ async function ensureDevice() {
 }
 
 async function playUris(uris, contextUri, offset) {
+  // Auto-continue off: "play from here" means just that track, not the rest
+  // of its album (an explicit "Play album" still plays the whole album).
+  if (!state.autoplay && contextUri && offset && offset.uri) { uris = [offset.uri]; contextUri = null; offset = undefined; }
   // A raw uris-based queue (dedup list, "Play all") isn't part of any
   // album-to-album auto-advance context, so starting one clears it.
   if (uris) state.albumQueue = null;
@@ -1047,9 +1143,31 @@ async function loadQueueView() {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const {currently_playing, queue} = await api('/spotify-api/player/queue');
+    const {currently_playing, queue, autoplay} = await api('/spotify-api/player/queue');
+    state.autoplay = autoplay;
     renderQueueView(currently_playing, queue);
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
+}
+
+// Removing an item / turning auto-continue off can't be done in Spotify's own
+// queue (no such API), so the server re-issues playback from the current
+// position without the dropped items -- can cause a very brief rebuffer.
+function removeButton(index, uri) {
+  const btn = el('button', 'button small', '×');
+  btn.title = 'Remove from queue';
+  btn.onclick = async e => {
+    e.stopPropagation();
+    btn.disabled = true;
+    try {
+      await api('/spotify-api/player/queue/remove', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index, uri})});
+      showToast('Removed');
+    } catch (err) {
+      showToast(err.message === 'queue_changed' ? 'Queue changed, refreshed' : 'Could not remove: ' + err.message);
+    }
+    loadQueueView();
+  };
+  return btn;
 }
 
 function renderQueueView(currentlyPlaying, queue) {
@@ -1061,10 +1179,40 @@ function renderQueueView(currentlyPlaying, queue) {
     nowList.appendChild(trackRow(currentlyPlaying));
     view.appendChild(nowList);
   }
-  view.appendChild(el('h2', null, 'Up Next'));
+  const heading = el('div', 'row');
+  heading.style.margin = '22px 0 10px';
+  const upNext = el('h2', null, 'Up Next');
+  upNext.style.margin = '0';
+  heading.appendChild(upNext);
+  const autoBtn = iconButton('<svg width="16" height="16" viewBox="0 0 20 20"><path d="M4 9V8a3 3 0 0 1 3-3h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M13 2.5L16 5l-3 2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M16 11v1a3 3 0 0 1-3 3H5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M7 17.5L4 15l3-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    'Auto-continue', 'icon-btn');
+  autoBtn.style.width = '32px'; autoBtn.style.height = '32px';
+  const syncAutoBtn = () => {
+    autoBtn.classList.toggle('active', state.autoplay);
+    autoBtn.title = state.autoplay ? 'Auto-continue: on' : 'Auto-continue: off';
+  };
+  syncAutoBtn();
+  autoBtn.onclick = async () => {
+    const next = !state.autoplay;
+    autoBtn.disabled = true;
+    try {
+      const r = await api('/spotify-api/queue-settings', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({autoplay: next})});
+      state.autoplay = r.autoplay;
+      showToast(r.autoplay ? 'Auto-continue on' : 'Auto-continue off' + (r.cleared ? ' — cleared ' + r.cleared + ' queued' : ''));
+    } catch (err) { showToast('Could not change: ' + err.message); }
+    loadQueueView();
+  };
+  heading.appendChild(autoBtn);
+  view.appendChild(heading);
+
   const list = el('ul', 'list');
   if (!queue.length) list.appendChild(el('li', 'empty', 'Nothing queued'));
-  for (const t of queue) list.appendChild(trackRow(t));
+  queue.forEach((t, i) => {
+    const li = trackRow(t, removeButton(i, t.uri));
+    if (t.manual) li.querySelector('.sub').appendChild(el('span', 'badge', 'added'));
+    list.appendChild(li);
+  });
   view.appendChild(list);
 }
 
@@ -1286,7 +1434,7 @@ function queueButton(uri) {
   return btn;
 }
 
-function trackRow(t) {
+function trackRow(t, actionBtn) {
   // Start the track's own album context at this track, same continuation
   // behavior as every other play entry point in the app.
   const playFromHere = () => playUris(null, 'spotify:album:' + t.album_id, {uri: t.uri});
@@ -1299,7 +1447,7 @@ function trackRow(t) {
   li.appendChild(meta);
   const playBtn = el('button', 'button small', '▶'); playBtn.onclick = playFromHere;
   li.appendChild(playBtn);
-  li.appendChild(queueButton(t.uri));
+  li.appendChild(actionBtn || queueButton(t.uri));
   return li;
 }
 
@@ -1540,7 +1688,21 @@ async function renderAlbumView(album) {
 // Album finished with nothing next queued by Spotify itself -- if it was
 // played from an artist's album list, auto-advance to the next album in that
 // same list, replacing the current view without adding Back history.
-async function advanceAlbumQueue(finishedAlbumId) {
+async function advanceAlbumQueue(finishedAlbumId, finishedTrackUri) {
+  if (!state.autoplay) return;
+  // First choice: the next track of the album that just finished (playback
+  // may have been rebuilt from a plain track list, which has no album context
+  // for Spotify to continue on its own).
+  if (finishedAlbumId && finishedTrackUri) {
+    try {
+      const album = await api('/spotify-api/albums/' + finishedAlbumId);
+      const i = album.tracks.findIndex(t => t.uri === finishedTrackUri);
+      if (i >= 0 && i + 1 < album.tracks.length) {
+        await playUris(null, 'spotify:album:' + finishedAlbumId, {uri: album.tracks[i + 1].uri});
+        return;
+      }
+    } catch (e) {}
+  }
   const queue = state.albumQueue;
   if (queue) {
     const nextPos = queue.pos + 1;
@@ -1658,7 +1820,8 @@ async function pollNowPlaying() {
     const justStopped = wasPlayingTick && !np.playing;
     wasPlayingTick = np.playing;
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
-    if (justStopped && nearEnd) await advanceAlbumQueue(np.track.album_id);
+    state.autoplay = np.autoplay !== false;
+    if (justStopped && nearEnd) await advanceAlbumQueue(np.track.album_id, np.track.uri);
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
@@ -2034,11 +2197,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"items": [t for t in out if t]})
 
     def handle_queue(self):
-        result = spotify_api("GET", "/me/player/queue")
-        self.send_json(200, {
-            "currently_playing": track_summary(result.get("currently_playing")),
-            "queue": [t for t in (track_summary(x) for x in result.get("queue", [])) if t],
-        })
+        current, items = fetch_queue_items()
+        flags = manual_flags(items)
+        # Anything V1 remembers as hand-added that's no longer queued has been
+        # played or removed -- forget it so it can't be mistaken for manual later.
+        manual_replace([t["uri"] for t, f in zip(items, flags) if f])
+        queue = []
+        for t, f in zip(items, flags):
+            summary = track_summary(t)
+            summary["manual"] = f
+            queue.append(summary)
+        self.send_json(200, {"currently_playing": track_summary(current), "queue": queue,
+                              "autoplay": get_autoplay()})
+
+    def handle_queue_remove(self, body):
+        index, uri = body.get("index"), body.get("uri")
+        _, items = fetch_queue_items()
+        if not isinstance(index, int) or not 0 <= index < len(items) or items[index].get("uri") != uri:
+            self.send_json(409, {"error": "queue_changed"}); return
+        keep = [t["uri"] for i, t in enumerate(items) if i != index]
+        if not rebuild_play(keep):
+            self.send_json(409, {"error": "no_active_playback"}); return
+        flags = manual_flags([t for i, t in enumerate(items) if i != index])
+        manual_replace([u for u, f in zip(keep, flags) if f])
+        self.send_json(200, {"ok": True})
+
+    def handle_set_autoplay(self, body):
+        enabled = bool(body.get("autoplay"))
+        cleared = 0
+        if not enabled:
+            # Turning auto-continue off drops everything queued that wasn't
+            # added by hand, keeping only the manual items.
+            _, items = fetch_queue_items()
+            flags = manual_flags(items)
+            keep = [t["uri"] for t, f in zip(items, flags) if f]
+            if len(keep) != len(items) and rebuild_play(keep):
+                cleared = len(items) - len(keep)
+            manual_replace(keep)
+        set_autoplay(enabled)
+        self.send_json(200, {"ok": True, "autoplay": enabled, "cleared": cleared})
 
     def handle_now_playing(self):
         result = spotify_api("GET", "/me/player")
@@ -2060,6 +2257,7 @@ class Handler(BaseHTTPRequestHandler):
                 "live": True,
             }
             set_last_playback(payload)
+            payload = dict(payload, autoplay=get_autoplay())
             self.send_json(200, payload)
             return
         # The Web Playback SDK device is this browser tab; Spotify reports no
@@ -2071,10 +2269,11 @@ class Handler(BaseHTTPRequestHandler):
         if cached:
             cached["playing"] = False
             cached["live"] = False
+            cached["autoplay"] = get_autoplay()
             self.send_json(200, cached)
             return
         self.send_json(200, {"playing": False, "progress_ms": 0, "device": None, "device_id": None,
-                              "track": None, "live": True})
+                              "track": None, "live": True, "autoplay": get_autoplay()})
 
     # -- PUT --
 
@@ -2135,6 +2334,8 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_json_body()
             set_view_state(body.get("view"), body.get("client_id"))
             self.send_json(200, {"ok": True}); return
+        if path == "/spotify-api/queue-settings":
+            self.handle_set_autoplay(self.read_json_body()); return
         match = FAVORITE_GENRES_RE.match(path)
         if match:
             body = self.read_json_body()
@@ -2188,7 +2389,10 @@ class Handler(BaseHTTPRequestHandler):
             if not uri:
                 self.send_json(400, {"error": "missing_uri"}); return
             spotify_api("POST", "/me/player/queue", params={"uri": uri, "device_id": body.get("device_id")})
+            manual_add(uri)
             self.send_json(200, {"ok": True}); return
+        if path == "/spotify-api/player/queue/remove":
+            self.handle_queue_remove(self.read_json_body()); return
         self.send_json(404, {"error": "not_found"})
 
 
