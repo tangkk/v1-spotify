@@ -2269,7 +2269,7 @@ async function pollNowPlaying() {
     npTitle.textContent = np.track.name;
     npTitle.onclick = np.track.album_id ? (() => goTo({type: 'album', id: np.track.album_id})) : null;
     npTitle.style.cursor = np.track.album_id ? 'pointer' : '';
-    document.getElementById('npSub').textContent = np.track.artists.join(', ') + (np.track.album ? ' · ' + np.track.album : '');
+    document.getElementById('npSub').textContent = [np.track.artists.join(', '), np.track.album, (np.track.release_date || '').slice(0, 4)].filter(Boolean).join(' · ');
     document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
     if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
@@ -2921,6 +2921,7 @@ class Handler(BaseHTTPRequestHandler):
                 "track": {
                     "name": item.get("name"), "artists": [a["name"] for a in item.get("artists", [])],
                     "album": item.get("album", {}).get("name"), "album_id": item.get("album", {}).get("id"),
+                    "release_date": item.get("album", {}).get("release_date", ""),
                     "duration_ms": item.get("duration_ms", 0),
                     "image": images[0]["url"] if images else None, "uri": item.get("uri"),
                 },
