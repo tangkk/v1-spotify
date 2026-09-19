@@ -107,15 +107,38 @@ _view_state_lock = threading.Lock()
 _view_state = {"view": None, "updated_at": 0.0, "updated_by": None}
 
 
+_view_state_loaded = False
+
+
 def set_view_state(view, client_id):
+    global _view_state_loaded
     with _view_state_lock:
         _view_state["view"] = view
         _view_state["updated_at"] = time.time()
         _view_state["updated_by"] = client_id
+        _view_state_loaded = True
+        saved = json.dumps(_view_state)
+    try:                      # kept across restarts: "reopen where you left off" shouldn't depend on uptime
+        with db() as conn:
+            conn.execute("""INSERT INTO app_settings(key, value) VALUES ('view_state', ?)
+                             ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (saved,))
+            conn.commit()
+    except Exception as exc:
+        print(f"view state not saved: {exc}", flush=True)
 
 
 def get_view_state():
+    global _view_state_loaded
     with _view_state_lock:
+        if not _view_state_loaded:
+            _view_state_loaded = True
+            try:
+                with db() as conn:
+                    row = conn.execute("SELECT value FROM app_settings WHERE key='view_state'").fetchone()
+                if row:
+                    _view_state.update(json.loads(row[0]))
+            except Exception as exc:
+                print(f"view state not loaded: {exc}", flush=True)
         return dict(_view_state)
 
 
@@ -548,6 +571,7 @@ _driver_wake = threading.Event()
 QUEUE_PUSH_WINDOW_MS = 15000
 DRIVER_MAX_NAP = 5.0
 AUTO_CAP = 30            # tracks in the auto section
+AUTO_LOW = 15            # topped up back to AUTO_CAP when it shrinks below this while playing
 AUTO_SEEDS = 4           # last manual albums the mix draws from
 AUTO_CHUNK = 3           # tracks taken from a seed per round-robin turn
 AUTO_ALBUMS_PER_SEED = 3 # following albums a seed may spill into
@@ -558,7 +582,7 @@ def load_queue():
         row = conn.execute("SELECT value FROM app_settings WHERE key='queue'").fetchone()
     q = json.loads(row[0]) if row else {}
     return {"next": q.get("next"), "manual": q.get("manual", []), "auto": q.get("auto", []),
-            "auto_tried": q.get("auto_tried")}
+            "auto_tried": q.get("auto_tried"), "auto_removed": q.get("auto_removed", [])}
 
 
 def save_queue(q):
@@ -658,21 +682,64 @@ def queue_seeds(q, fallback=None):
     return [(last["album_id"], last["uri"])] if last.get("album_id") else []
 
 
-def refresh_auto(fallback_anchor=None):
+def refresh_auto(fallback_anchor=None, current_uri=None):
     """Rebuild the auto section: emptied while auto-continue is off, a mix
-    seeded from the queue's last manual tracks when it's on. Returns its length."""
+    seeded from the queue's last manual tracks when it's on. Tracks the user
+    removed from it (×) and the one playing now stay out. Returns its length."""
     auto = []
     if get_autoplay():
         with _queue_lock:
             q = load_queue()
-        exclude = {t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
+        exclude = ({t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
+                   | set(q["auto_removed"]) | ({current_uri} if current_uri else set()))
         auto = compute_auto(queue_seeds(q, fallback_anchor), exclude)
     with _queue_lock:
         q = load_queue()
-        taken = {t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
+        taken = ({t["uri"] for t in q["manual"]} | ({q["next"]["uri"]} if q["next"] else set())
+                 | set(q["auto_removed"]) | ({current_uri} if current_uri else set()))
         q["auto"] = [t for t in auto if t["uri"] not in taken]   # the driver may have committed one meanwhile
         save_queue(q)
         return len(q["auto"])
+
+
+def refresh_auto_async():
+    """Recompute the auto section off the request thread (may touch Spotify)."""
+    if not get_autoplay():
+        return None
+    def run():
+        try:
+            refresh_auto()
+        except Exception as exc:
+            print(f"queue: refresh_auto failed: {exc}", flush=True)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+_topup_key = None
+
+
+def topup_auto(item):
+    """Auto-continue keeps ~AUTO_CAP tracks ahead: the section is consumed as
+    tracks play, so once per playing track, if it has shrunk below AUTO_LOW,
+    recompute it from the queue (or, with nothing queued, from what's playing)."""
+    global _topup_key
+    if not get_autoplay() or len(load_queue()["auto"]) >= AUTO_LOW:
+        return
+    if item:
+        uri, album_id = item["uri"], (item.get("album") or {}).get("id")
+    else:
+        last = (get_last_playback() or {}).get("track") or {}
+        uri, album_id = last.get("uri"), last.get("album_id")
+    if not uri or uri == _topup_key:
+        return
+    _topup_key = uri      # once per track: an exhausted discography isn't retried every tick
+    def run():
+        try:
+            refresh_auto((album_id, uri), uri)
+        except Exception as exc:
+            print(f"queue: top-up failed: {exc}", flush=True)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def queue_add(track):
@@ -684,6 +751,7 @@ def queue_add(track):
                 break
         q["manual"].append(track)
         save_queue(q)
+    refresh_auto_async()   # the mix is seeded from the last manual tracks, which just changed
     _driver_wake.set()
 
 
@@ -693,8 +761,12 @@ def queue_remove(which, index, uri):
         lst = q.get(which) if which in ("manual", "auto") else None
         if lst is None or not isinstance(index, int) or not 0 <= index < len(lst) or lst[index]["uri"] != uri:
             return False
-        del lst[index]
+        removed = lst.pop(index)
+        if which == "auto":
+            q["auto_removed"] = (q["auto_removed"] + [removed["uri"]])[-200:]   # don't top it back up
         save_queue(q)
+    if which == "manual":
+        refresh_auto_async()
     return True
 
 
@@ -800,6 +872,7 @@ def queue_driver_tick():
         return 30
     player = spotify_api("GET", "/me/player") or {}
     item = player.get("item")
+    topup_auto(item)
     if not item:
         return 15
     progress = player.get("progress_ms", 0)
@@ -820,7 +893,7 @@ def queue_driver_tick():
                 q2 = load_queue()
                 q2["auto_tried"] = item["uri"]
                 save_queue(q2)
-            refresh_auto()
+            refresh_auto((item.get("album", {}).get("id"), item["uri"]), item["uri"])
         committed = queue_commit_head(item["uri"])
         if committed:
             head, kind = committed
@@ -2207,36 +2280,50 @@ function applyMediaMetadata(meta) {
 // our silent element, which just kept playing, doesn't count as newer. So:
 // restart the silent element so this page is the most recent player again, and
 // re-write the metadata now and a bit later, in case iOS updated after us.
-let reclaimSeq = 0, lastReclaimAt = 0;
+let lastReclaimAt = 0;
 
 // Restart the silent element (and re-publish the metadata after it): what makes
 // iOS show this page again once the iframe's audio is really making sound.
-function restartLockAudio(uri, seq) {
-  if (seq !== reclaimSeq || mediaTrackUri !== uri || !lockAudio || lockAudio.paused || (sdkPos && sdkPos.paused)) return;
+function restartLockAudio(uri) {
+  if (mediaTrackUri !== uri || !lockAudio || lockAudio.paused || (sdkPos && sdkPos.paused)) return;
   lastReclaimAt = Date.now();
   lockAudio.pause();
   setTimeout(() => {
     if (sdkPos && sdkPos.paused) return;    // the user paused meanwhile
     lockAudioPlay();
-    if (seq === reclaimSeq && mediaMeta) { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
+    if (mediaTrackUri === uri && mediaMeta) { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
   }, 100);
 }
 
+// iOS only re-publishes the cover when the artwork *changes*; writing the same
+// metadata again does nothing, so an overwritten cover stays missing until a
+// pause (which republishes everything). Drop the artwork and put it back.
+function republishArtwork(uri) {
+  if (mediaTrackUri !== uri || !mediaMeta || !mediaMeta.artwork || !mediaMeta.artwork.length) return;
+  const meta = mediaMeta;
+  applyMediaMetadata(Object.assign({}, meta, {artwork: []}));
+  setTimeout(() => {
+    if (mediaTrackUri === uri) applyMediaMetadata(meta);
+  }, 250);
+}
+
 // full: a new track. Nothing is paused/restarted while the track is switching
-// (touching the silent element right then made the change itself slower); once
-// the new track is really playing, restart the silent element once at 3s.
+// (touching the silent element right then made the change itself slower). The
+// iframe only takes Now Playing over once the new track is really playing, at
+// an unknown moment in the first seconds, so re-publish the cover a few times.
 function reclaimNowPlaying(uri, paused, full) {
   if (!hasMediaSession) return;
-  const seq = ++reclaimSeq;
   if (mediaMeta) applyMediaMetadata(mediaMeta);
-  if (!full && lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri, seq);
-  const later = full ? [[1500, false], [3000, true], [8000, false]] : [[1500, false], [5000, false]];
-  for (const [ms, restart] of later) {
+  if (!full && lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri);
+  const later = full
+    ? [[1200, 'art'], [2500, 'art'], [3000, 'restart'], [4500, 'art'], [7000, 'art'], [11000, 'art']]
+    : [[1500, 'write'], [5000, 'write']];
+  for (const [ms, what] of later) {
     setTimeout(() => {
-      if (seq !== reclaimSeq || mediaTrackUri !== uri || !mediaMeta) return;   // a newer reclaim/track took over
-      if (restart) { restartLockAudio(uri, seq); return; }
-      applyMediaMetadata(mediaMeta);
-      updateMediaPosition();
+      if (mediaTrackUri !== uri || !mediaMeta) return;   // a newer track took over
+      if (what === 'restart') restartLockAudio(uri);
+      else if (what === 'art') republishArtwork(uri);
+      else { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
     }, ms);
   }
 }
@@ -2371,7 +2458,8 @@ setInterval(renderProgress, 250);
       document.getElementById('searchPanel').style.display = '';
       pollNowPlaying();
       const remote = await api('/spotify-api/view-state');
-      if (remote.view) { lastAppliedViewAt = remote.updated_at || 0; await applyRemoteView(remote.view); }
+      lastAppliedViewAt = remote.updated_at || 0;
+      await applyRemoteView(remote.view);   // no saved view (fresh server, first visit): applyRemoteView shows home
     }
   } catch (e) {
     document.getElementById('connectPanel').style.display = '';
