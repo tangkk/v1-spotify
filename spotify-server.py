@@ -1218,6 +1218,7 @@ let sdkPlayerReady = false;
 let sdkPlayerWaiters = [];
 let deviceReadyWaiters = [];
 let playerStateTimer = null;
+let sdkTrackUri = null;   // last track this device's SDK reported, to spot a track change
 let sdkPos = null;   // this device's own last player state: {uri, position, duration, paused, at}
 
 function initSDK() {
@@ -1242,6 +1243,8 @@ function initSDK() {
     player.addListener('player_state_changed', st => {
       const cur = st && st.track_window && st.track_window.current_track;
       sdkPos = cur ? {uri: cur.uri, position: st.position, duration: st.duration, paused: st.paused, at: Date.now()} : null;
+      if (cur && cur.uri !== sdkTrackUri) onSdkTrackChange(cur, st);
+      sdkTrackUri = cur ? cur.uri : null;
       updateMediaPosition();
       clearTimeout(playerStateTimer);
       playerStateTimer = setTimeout(pollNowPlaying, 300);
@@ -2182,6 +2185,40 @@ function updateMediaPosition() {
   } catch (e) {}
 }
 
+let mediaMeta = null;
+
+function applyMediaMetadata(meta) {
+  if (!hasMediaSession) return;
+  mediaMeta = meta;
+  try { navigator.mediaSession.metadata = new MediaMetadata(meta); } catch (e) {}
+}
+
+// When a new track starts, the SDK iframe's audio starts again and iOS gives
+// Now Playing back to it (generic title, no artwork). So on every track change,
+// straight from the SDK event (no server round trip, works in the background):
+// write the metadata, restart the silent element so this page is the most recent
+// player again, and repeat the write a bit later in case iOS updated after us.
+function onSdkTrackChange(cur, st) {
+  if (!hasMediaSession) return;
+  const images = (cur.album && cur.album.images) || [];
+  mediaTrackUri = cur.uri;
+  applyMediaMetadata({
+    title: cur.name || '', artist: (cur.artists || []).map(a => a.name).join(', '), album: (cur.album && cur.album.name) || '',
+    artwork: images.map(i => ({src: i.url, sizes: (i.width || 640) + 'x' + (i.height || 640), type: 'image/jpeg'})),
+  });
+  if (lockAudio && !lockAudio.paused && !st.paused) {
+    lockAudio.pause();
+    setTimeout(() => { if (mediaTrackUri === cur.uri) lockAudioPlay(); }, 100);
+  }
+  for (const ms of [1500, 5000]) {
+    setTimeout(() => {
+      if (mediaTrackUri !== cur.uri || !mediaMeta) return;
+      applyMediaMetadata(mediaMeta);
+      updateMediaPosition();
+    }, ms);
+  }
+}
+
 function updateMediaSession(np) {
   if (!hasMediaSession) return;
   try {
@@ -2194,7 +2231,7 @@ function updateMediaSession(np) {
     }
     if (np.track.uri !== mediaTrackUri) {   // only on track change, so the artwork isn't reloaded every poll
       mediaTrackUri = np.track.uri;
-      navigator.mediaSession.metadata = new MediaMetadata({
+      applyMediaMetadata({
         title: np.track.name || '', artist: (np.track.artists || []).join(', '), album: np.track.album || '',
         artwork: np.track.image ? [{src: np.track.image, sizes: '640x640', type: 'image/jpeg'}] : [],
       });
