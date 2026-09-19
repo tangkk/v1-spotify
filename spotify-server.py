@@ -1722,6 +1722,24 @@ function eraOf(releaseDate) {
 let favoritesState = null;
 let favoritesFilter = {artist: '', genre: '', era: ''};
 
+// Sort order is a preference, not a filter: it survives reloading the list and
+// is remembered per browser.
+const FAV_ORDERS = [['year', 'Order: Year'], ['added', 'Order: Recently added'], ['alpha', 'Order: A–Z']];
+let favoritesOrder = 'year';
+try { const o = localStorage.getItem('spotify_fav_order'); if (FAV_ORDERS.some(x => x[0] === o)) favoritesOrder = o; } catch (e) {}
+
+// Year: newest first, exact release date as the tie-break; albums with no date go last.
+function sortFavorites(items, order) {
+  const byName = (a, b) => (a.name || '').localeCompare(b.name || '', undefined, {sensitivity: 'base'});
+  const cmp = {
+    alpha: byName,
+    added: (a, b) => (b.added_at || 0) - (a.added_at || 0) || byName(a, b),
+    year: (a, b) => (a.release_date ? 0 : 1) - (b.release_date ? 0 : 1)
+      || (b.release_date || '').localeCompare(a.release_date || '') || byName(a, b),
+  }[order];
+  return items.slice().sort(cmp);
+}
+
 async function loadFavorites() {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
@@ -1770,9 +1788,14 @@ function renderFavoritesView() {
   if (hasUnknownEra) eraOptions.push([UNKNOWN_ERA, 'Unknown era']);
   filterRow.appendChild(buildFilterSelect(eraOptions, favoritesFilter.era,
     v => { favoritesFilter.era = v; renderFavoritesView(); }));
+  filterRow.appendChild(buildFilterSelect(FAV_ORDERS, favoritesOrder, v => {
+    favoritesOrder = v;
+    try { localStorage.setItem('spotify_fav_order', v); } catch (e) {}
+    renderFavoritesView();
+  }));
   view.appendChild(filterRow);
 
-  const filtered = favoritesState.filter(a => {
+  const filtered = sortFavorites(favoritesState, favoritesOrder).filter(a => {
     if (favoritesFilter.artist && !(a.artists || []).includes(favoritesFilter.artist)) return false;
     const genres = a.genres || [];
     if (favoritesFilter.genre === UNTAGGED && genres.length) return false;
