@@ -2269,7 +2269,7 @@ async function pollNowPlaying() {
     npTitle.textContent = np.track.name;
     npTitle.onclick = np.track.album_id ? (() => goTo({type: 'album', id: np.track.album_id})) : null;
     npTitle.style.cursor = np.track.album_id ? 'pointer' : '';
-    document.getElementById('npSub').textContent = np.track.artists.join(', ') + ' · ' + (np.device || '');
+    document.getElementById('npSub').textContent = np.track.artists.join(', ') + (np.track.album ? ' · ' + np.track.album : '');
     document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
     if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
