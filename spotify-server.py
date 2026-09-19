@@ -1375,19 +1375,6 @@ let playerStateTimer = null;
 let sdkTrackUri = null;   // last track this device's SDK reported, to spot a track change
 let sdkPos = null;   // this device's own last player state: {uri, position, duration, paused, at}
 
-// While the SDK iframe owns the lock screen, iOS shows a name for it
-// ("Spotify Embedded Player"). The iframe *element* is ours even though its
-// content isn't, so give it a title of our own; whether iOS uses it is untested.
-// (Only title: changing its name/src would break the SDK's messaging.)
-function retitleSdkFrame(node) {
-  if (node && node.tagName === 'IFRAME' && /sdk\.scdn\.co/.test(node.src || '')) node.title = 'Spotify';
-}
-try {
-  document.querySelectorAll('iframe').forEach(retitleSdkFrame);
-  new MutationObserver(records => records.forEach(r => r.addedNodes.forEach(retitleSdkFrame)))
-    .observe(document.documentElement, {childList: true, subtree: true});
-} catch (e) {}
-
 function initSDK() {
   window.onSpotifyWebPlaybackSDKReady = () => {
     const player = new Spotify.Player({
@@ -2320,10 +2307,7 @@ function unlockLockAudio() {
   a.pause();
 }
 
-let lockAudioHoldUntil = 0;   // while set, only the hold's own timer may restart the silent element
-
-function lockAudioPlay(force) {
-  if (!force && Date.now() < lockAudioHoldUntil) return;
+function lockAudioPlay() {
   clearTimeout(lockAudioIdleTimer); lockAudioIdleTimer = null;
   const a = getLockAudio();
   if (a && a.paused) a.play().catch(() => {});
@@ -2386,34 +2370,29 @@ function applyMediaMetadata(meta) {
 // seek/resume; on a track change it usually doesn't, which is accepted.
 let lastReclaimAt = 0;
 
-// pauseMs: how long the *silent element alone* stays paused (the music is never
-// touched). A manual pause, which does bring the logo back, pauses it for seconds;
-// a 100ms blip apparently isn't enough for iOS to treat the page as a fresh player.
-function restartLockAudio(uri, pauseMs) {
+function restartLockAudio(uri) {
   if (mediaTrackUri !== uri || !lockAudio || lockAudio.paused || (sdkPos && sdkPos.paused)) return;
   lastReclaimAt = Date.now();
-  lockAudioHoldUntil = Date.now() + (pauseMs || 100);
   lockAudio.pause();
   setTimeout(() => {
-    lockAudioHoldUntil = 0;
     if (sdkPos && sdkPos.paused) return;    // the user paused meanwhile
-    lockAudioPlay(true);
+    lockAudioPlay();
     if (mediaTrackUri === uri && mediaMeta) { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
-  }, pauseMs || 100);
+  }, 100);
 }
 
 // full: a new track. Nothing is paused/restarted while the track is switching
 // (touching the silent element right then made the change itself slower); once
-// it is really playing, pause the silent element for 1.5s at 2.5s.
+// it is really playing, restart the silent element once at 3s.
 function reclaimNowPlaying(uri, paused, full) {
   if (!hasMediaSession) return;
   if (mediaMeta) applyMediaMetadata(mediaMeta);
   if (!full && lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) restartLockAudio(uri);
-  const later = full ? [[1500, 'write'], [2500, 'restart'], [8000, 'write']] : [[1500, 'write'], [5000, 'write']];
+  const later = full ? [[1500, 'write'], [3000, 'restart'], [8000, 'write']] : [[1500, 'write'], [5000, 'write']];
   for (const [ms, what] of later) {
     setTimeout(() => {
       if (mediaTrackUri !== uri || !mediaMeta) return;   // a newer track took over
-      if (what === 'restart') restartLockAudio(uri, 1500);   // a new track: long enough to look like a real pause
+      if (what === 'restart') restartLockAudio(uri);
       else { applyMediaMetadata(mediaMeta); updateMediaPosition(); }
     }, ms);
   }
