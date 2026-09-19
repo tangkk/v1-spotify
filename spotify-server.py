@@ -1293,6 +1293,7 @@ const ICON_PLUS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 
 const ICON_SORT_ASC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16V4M5 9l5-5 5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_SORT_DESC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 4v12M5 11l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_TRASH = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M4 5.5h12M8 5.5V3.5h4v2M5.5 5.5l.8 11h7.4l.8-11M8.5 9v4.5M11.5 9v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ICON_MORE = '<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="4.5" cy="10" r="1.5" fill="currentColor"/><circle cx="10" cy="10" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10" r="1.5" fill="currentColor"/></svg>';
 const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 
 // Row action buttons (play / add to queue / remove) are the same 38px icon
@@ -1801,7 +1802,8 @@ function renderFavoritesView() {
     li.appendChild(coverImg(a.image));
     const meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', a.name));
-    meta.appendChild(el('div', 'sub', (a.artists || []).join(', ')));
+    const year = (a.release_date || '').slice(0, 4);
+    meta.appendChild(el('div', 'sub', (a.artists || []).join(', ') + (year ? ' · ' + year : '')));
     meta.onclick = () => goTo({type: 'album', id: a.id});
     li.appendChild(meta);
     const tags = el('div', 'genre-tags');
@@ -1889,7 +1891,7 @@ async function runSearch(query, kind) {
 
 async function loadMoreSearch(btn) {
   btn.disabled = true;
-  btn.textContent = 'Loading…';
+  btn.title = 'Loading…';
   try {
     const page = await api('/spotify-api/search/' + searchState.kind + 's?q=' + encodeURIComponent(searchState.query) +
                             '&offset=' + searchState.items.length);
@@ -1898,7 +1900,7 @@ async function loadMoreSearch(btn) {
     renderSearchResults();
   } catch (e) {
     btn.disabled = false;
-    btn.textContent = 'More';
+    btn.title = 'More results';
   }
 }
 
@@ -1994,7 +1996,7 @@ function renderSearchResults() {
   for (const item of items) list.appendChild(SEARCH_KIND_ROW[kind](item));
   view.appendChild(list);
   if (has_more) {
-    const moreBtn = el('button', 'button small', 'More');
+    const moreBtn = iconButton(ICON_MORE, 'More results');
     moreBtn.style.marginTop = '8px';
     moreBtn.onclick = () => loadMoreSearch(moreBtn);
     view.appendChild(moreBtn);
