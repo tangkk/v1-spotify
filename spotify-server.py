@@ -1131,6 +1131,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
   .error { color:#b00020; font-size:13px; margin-top:8px; }
   .toast { position:fixed; bottom:90px; left:50%; transform:translateX(-50%); background:#000; color:#fff;
            padding:8px 16px; font-size:13px; z-index:1000; max-width:90vw; text-align:center; }
+  .link { color:inherit; cursor:pointer; text-decoration:underline; text-decoration-color:#bbb; text-underline-offset:2px; }
+  .link:hover { color:#000; text-decoration-color:#000; }
   .crumbs { font-size:13px; color:#666; margin-bottom:6px; }
   .crumbs a { color:#000; text-decoration:none; cursor:pointer; }
   #nowplaying { position:fixed; left:0; right:0; bottom:0; background:#fff; border-top:1px solid #000;
@@ -2060,7 +2062,18 @@ async function renderAlbumView(album) {
   header.appendChild(coverImg(album.image, 'cover lg'));
   const meta = el('div');
   meta.appendChild(el('div', 'title', album.name));
-  meta.appendChild(el('div', 'sub', (album.artists || []).join(', ') + ' · ' + (album.release_date || '')));
+  // Each artist is a link to that artist's albums (when their ids are known).
+  const sub = el('div', 'sub');
+  (album.artists || []).forEach((name, i) => {
+    if (i) sub.appendChild(document.createTextNode(', '));
+    const id = (album.artist_ids || [])[i];
+    if (!id) { sub.appendChild(document.createTextNode(name)); return; }
+    const link = el('a', 'link', name);
+    link.onclick = () => goTo({type: 'artist', id, name});
+    sub.appendChild(link);
+  });
+  sub.appendChild(document.createTextNode(' · ' + (album.release_date || '')));
+  meta.appendChild(sub);
   header.appendChild(meta);
   view.appendChild(header);
 
@@ -2752,6 +2765,12 @@ class Handler(BaseHTTPRequestHandler):
         # metadata + tracks (paginated at this app's limit=10) every visit.
         cached = None if force else get_favorite_album_detail(album_id)
         if cached:
+            # The favorites table keeps artist names only; the ids (for the
+            # clickable artists) come from the permanently cached album metadata.
+            try:
+                cached["artist_ids"] = [a["id"] for a in fetch_album_meta(album_id).get("artists", [])]
+            except Exception:
+                pass
             self.send_json(200, cached)
             return
         album = fetch_album_meta(album_id, force=force)
@@ -2761,6 +2780,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": album["id"], "name": album["name"], "album_type": album.get("album_type", ""),
             "release_date": album.get("release_date", ""), "image": images[0]["url"] if images else None,
             "artists": [a["name"] for a in album.get("artists", [])],
+            "artist_ids": [a["id"] for a in album.get("artists", [])],
             "tracks": [{"id": t["id"], "uri": t["uri"], "name": t["name"],
                         "track_number": t.get("track_number", 0), "disc_number": t.get("disc_number", 1),
                         "duration_ms": t.get("duration_ms", 0),
