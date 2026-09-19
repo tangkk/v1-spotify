@@ -1221,10 +1221,6 @@ SPOTIFY_PAGE = r"""<!doctype html>
   #nowplaying .track .title:hover { text-decoration:underline; }
   #nowplaying .track .sub { font-size:11px; color:#666; }
   #nowplaying .controls { display:flex; align-items:center; gap:6px; flex:none; }
-  #nowplaying .controls button { border:1px solid #000; background:#fff; color:#000; padding:6px 10px;
-                                  font:inherit; font-size:12px; cursor:pointer; -webkit-appearance:none; appearance:none; }
-  #nowplaying .controls button:hover { background:#f0f0f0; }
-  #nowplaying .controls button#npPlay { min-width:52px; }
   #nowplaying .volume { display:flex; align-items:center; flex:none; }
   #nowplaying .volume input[type=range] { width:70px; accent-color:#000; }
   #nowplaying .progress-row { display:flex; align-items:center; gap:8px; order:-1; }
@@ -1251,13 +1247,12 @@ SPOTIFY_PAGE = r"""<!doctype html>
   body.fs #nowplaying .progress-row { order:3; width:min(92vw, 720px); gap:12px; }
   body.fs #nowplaying .progress-row .time { font-size:clamp(13px, 2.6vw, 18px); min-width:46px; }
   body.fs #nowplaying .controls { order:4; gap:12px; }
-  body.fs #nowplaying .controls button { padding:12px 22px; font-size:clamp(14px, 3vw, 20px); }
-  body.fs #nowplaying .controls button#npPlay { min-width:96px; }
+  body.fs #nowplaying .controls .icon-btn { width:clamp(48px, 11vw, 64px); height:clamp(48px, 11vw, 64px); }
+  body.fs #nowplaying .controls .icon-btn svg { width:52%; height:52%; }
   body.fs #nowplaying .volume { order:5; }
   body.fs #nowplaying .volume input[type=range] { width:min(60vw, 260px); }
   @media (max-width: 520px) {
     #nowplaying .track .sub { display:none; }
-    #nowplaying .controls button { padding:6px 8px; font-size:11px; }
     #searchPanel input[type=text] { flex-basis:100%; }
   }
 </style>
@@ -1298,9 +1293,9 @@ SPOTIFY_PAGE = r"""<!doctype html>
       <div class="sub" id="npSub"></div>
     </div>
     <div class="controls">
-      <button id="npPrev">Prev</button>
-      <button id="npPlay">Play</button>
-      <button id="npNext">Next</button>
+      <button class="icon-btn" id="npPrev" title="Previous" aria-label="Previous"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 4v12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 4.5v11L8 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
+      <button class="icon-btn" id="npPlay" title="Play" aria-label="Play"></button>
+      <button class="icon-btn" id="npNext" title="Next" aria-label="Next"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M15 4v12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M4.5 4.5v11L12 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
     </div>
     <div class="volume">
       <input type="range" id="npVolume" min="0" max="100" value="70">
@@ -2225,6 +2220,16 @@ async function togglePlayPause(want) {
   }
   pollNowPlaying();
 }
+// Play/pause share one button; the glyph shows the action a click will take.
+const ICON_PLAY = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M6 3.5v13L16.5 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
+const ICON_PAUSE = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M6.5 4v12M13.5 4v12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+function setPlayButton(playing) {
+  const b = document.getElementById('npPlay');
+  b.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
+  b.title = playing ? 'Pause' : 'Play';
+  b.setAttribute('aria-label', b.title);
+}
+setPlayButton(false);
 document.getElementById('npPlay').onclick = () => togglePlayPause();
 
 // Spacebar play/pause, except while actually typing (a text input/textarea
@@ -2270,7 +2275,7 @@ async function pollNowPlaying() {
     npTitle.onclick = np.track.album_id ? (() => goTo({type: 'album', id: np.track.album_id})) : null;
     npTitle.style.cursor = np.track.album_id ? 'pointer' : '';
     document.getElementById('npSub').textContent = [np.track.artists.join(', '), np.track.album, (np.track.release_date || '').slice(0, 4)].filter(Boolean).join(' · ');
-    document.getElementById('npPlay').textContent = np.playing ? 'Pause' : 'Play';
+    setPlayButton(np.playing);
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
     if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
     updateMediaSession(np);
