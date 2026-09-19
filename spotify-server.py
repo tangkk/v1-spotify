@@ -2366,10 +2366,48 @@ function dataUrlArtwork(dataUrl) {
   return [{src: dataUrl, sizes: '640x640', type}];
 }
 
+// Workaround for the lock screen losing title + cover on every track change
+// (the SDK iframe takes Now Playing over and nothing on the page's side wins it
+// back, but a real pause/resume of the music does): with the page in the
+// background, 2s into a new track pause the player for 0.6s and resume it. The
+// cost is a short silence each song, so it's off while the page is visible, and
+// ?nudge=0 turns it off entirely (remembered), ?nudge=1 back on.
+const NUDGE_DELAY_MS = 2000, NUDGE_PAUSE_MS = 600;
+const nudgeEnabled = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('nudge');
+    if (q !== null) localStorage.setItem('lockscreenNudge', q);
+    return localStorage.getItem('lockscreenNudge') !== '0';
+  } catch (e) { return true; }
+})();
+
+function scheduleNudge(uri) {
+  if (!nudgeEnabled) return;
+  setTimeout(async () => {
+    if (document.visibilityState !== 'hidden') return;                 // only the lock screen has the problem
+    if (!state.player || !sdkPos || sdkPos.uri !== uri || sdkPos.paused || mediaTrackUri !== uri) return;
+    const position = sdkPos.position + (Date.now() - sdkPos.at);
+    if (sdkPos.duration - position < 10000) return;                    // don't cut into the next transition
+    try { await state.player.pause(); } catch (e) { return; }
+    setTimeout(async () => {
+      try { await state.player.resume(); } catch (e) {}
+    }, NUDGE_PAUSE_MS);
+    setTimeout(async () => {                                           // resume didn't take: don't leave the music stopped
+      if (sdkPos && sdkPos.uri === uri && sdkPos.paused && state.deviceId) {
+        try {
+          await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({device_id: state.deviceId})});
+        } catch (e) {}
+      }
+    }, 3000);
+  }, NUDGE_DELAY_MS);
+}
+
 // A new track: take the metadata straight from the SDK event (no server round
 // trip, works in the background), then reclaim.
 function onSdkTrackChange(cur, st) {
   if (!hasMediaSession) return;
+  const isChange = !!sdkTrackUri;    // the very first state after loading isn't a track change
   const images = (cur.album && cur.album.images) || [];
   const artUrl = pickArtworkUrl(images);
   const cached = artUrl && artworkCache.get(artUrl);
@@ -2380,6 +2418,7 @@ function onSdkTrackChange(cur, st) {
       : images.map(i => ({src: i.url, sizes: (i.width || 640) + 'x' + (i.height || 640), type: 'image/jpeg'})),
   });
   reclaimNowPlaying(cur.uri, st.paused, true);
+  if (isChange && !st.paused) scheduleNudge(cur.uri);
   if (!cached) {
     loadArtwork(artUrl).then(dataUrl => {
       if (!dataUrl || mediaTrackUri !== cur.uri || !mediaMeta) return;
