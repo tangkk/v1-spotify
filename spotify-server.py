@@ -1629,7 +1629,7 @@ function renderQueueView(q) {
   const upNext = el('h2', null, 'Up Next');
   upNext.style.margin = '0';
   heading.appendChild(upNext);
-  const autoBtn = iconButton('<svg width="16" height="16" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.3 6.8L13.2 10l-4.9 3.2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  const autoBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.3 6.8L13.2 10l-4.9 3.2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
     'Auto up next', 'icon-btn');
   autoBtn.classList.toggle('active', state.autoplay);
   autoBtn.title = state.autoplay ? 'Auto up next: on' : 'Auto up next: off';
@@ -2025,9 +2025,8 @@ function renderArtistView(artist) {
   const artistTitle = el('h2', null, artist.name);
   artistTitle.style.margin = '0';
   heading.appendChild(artistTitle);
-  const refreshBtn = iconButton('<svg width="14" height="14" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-    'Update cache', 'icon-btn small');
-  refreshBtn.style.width = '26px'; refreshBtn.style.height = '26px';
+  const refreshBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    'Update cache');
   refreshBtn.onclick = () => loadArtist(artist.id, artist.name, true);
   heading.appendChild(refreshBtn);
   view.appendChild(heading);
@@ -2180,9 +2179,8 @@ async function renderAlbumView(album) {
   };
   actions.appendChild(favBtn);
 
-  const refreshBtn = iconButton('<svg width="14" height="14" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-    'Update cache', 'icon-btn small');
-  refreshBtn.style.width = '32px'; refreshBtn.style.height = '32px';
+  const refreshBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    'Update cache');
   refreshBtn.onclick = () => loadAlbum(album.id, true);
   actions.appendChild(refreshBtn);
   view.appendChild(actions);
