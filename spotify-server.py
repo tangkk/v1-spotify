@@ -1265,6 +1265,7 @@ function waitForPlayerObject(timeoutMs) {
 // slow network), wait briefly for the Player object to exist -- best effort,
 // since that wait technically happens outside the original gesture.
 async function ensureAudioUnlocked() {
+  unlockLockAudio();   // synchronously, while this is still the click's gesture
   if (sdkConnectTriggered) return;
   if (!sdkPlayerReady) await waitForPlayerObject(5000);
   if (!state.player || sdkConnectTriggered) return;
@@ -2076,6 +2077,69 @@ progressInput.addEventListener('change', async () => {
   try { await seekToMs(Math.round(Number(progressInput.value))); } finally { draggingProgress = false; }
 });
 
+// ---- page-owned silent audio ----
+// The Web Playback SDK plays inside its own cross-origin iframe ("Spotify
+// Embedded Player"), and iOS hands the lock screen's Now Playing to whichever
+// frame is actually making sound -- so the metadata set below is ignored and
+// the lock screen shows the iframe's generic title and no artwork. A silent,
+// looping element owned by *this* page makes the page the Now Playing app, and
+// also keeps iOS from suspending the page in the gap between two tracks.
+// Opt out with ?lockscreen=0 (remembered), back in with ?lockscreen=1, in case
+// a device pauses Spotify when a second audio element starts.
+const lockAudioEnabled = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('lockscreen');
+    if (q !== null) localStorage.setItem('lockscreenAudio', q);
+    return localStorage.getItem('lockscreenAudio') !== '0';
+  } catch (e) { return true; }
+})();
+let lockAudio = null;
+let lockAudioIdleTimer = null;
+
+function silentWavUrl() {
+  const rate = 8000, samples = rate * 2, buf = new ArrayBuffer(44 + samples * 2), v = new DataView(buf);
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + samples * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, samples * 2, true);   // sample bytes stay 0: silence
+  return URL.createObjectURL(new Blob([buf], {type: 'audio/wav'}));
+}
+
+function getLockAudio() {
+  if (!lockAudioEnabled) return null;
+  if (!lockAudio) {
+    lockAudio = new Audio(silentWavUrl());
+    lockAudio.loop = true;
+    lockAudio.setAttribute('playsinline', '');
+  }
+  return lockAudio;
+}
+
+// Called at the top of every transport click: a play()/pause() inside a user
+// gesture is what lets the element be started later without one.
+function unlockLockAudio() {
+  const a = getLockAudio();
+  if (!a || !a.paused) return;
+  a.play().catch(() => {});
+  a.pause();
+}
+
+function lockAudioPlay() {
+  clearTimeout(lockAudioIdleTimer); lockAudioIdleTimer = null;
+  const a = getLockAudio();
+  if (a && a.paused) a.play().catch(() => {});
+}
+
+// Paused Spotify keeps the silent audio going for a moment: the gap between two
+// tracks briefly reports "not playing", and pausing here would defeat the point.
+function lockAudioIdleSoon(immediately) {
+  if (!lockAudio) return;
+  if (immediately) { clearTimeout(lockAudioIdleTimer); lockAudioIdleTimer = null; lockAudio.pause(); return; }
+  if (lockAudioIdleTimer) return;
+  lockAudioIdleTimer = setTimeout(() => { lockAudioIdleTimer = null; if (lockAudio) lockAudio.pause(); }, 15000);
+}
+
 // ---- Media Session (lock screen / control centre / headset buttons) ----
 // Tells the OS what is playing and routes its transport buttons through the
 // same functions as the on-page buttons, so they honour V1's queue. It also
@@ -2100,6 +2164,7 @@ function updateMediaSession(np) {
       navigator.mediaSession.metadata = null;
       navigator.mediaSession.playbackState = 'none';
       mediaTrackUri = null;
+      lockAudioIdleSoon(true);
       return;
     }
     if (np.track.uri !== mediaTrackUri) {   // only on track change, so the artwork isn't reloaded every poll
@@ -2110,14 +2175,15 @@ function updateMediaSession(np) {
       });
     }
     navigator.mediaSession.playbackState = np.playing ? 'playing' : 'paused';
+    if (np.playing) lockAudioPlay(); else lockAudioIdleSoon(false);
     updateMediaPosition();
   } catch (e) {}
 }
 
 if (hasMediaSession) {
   const mediaActions = {
-    play: () => togglePlayPause(true),
-    pause: () => togglePlayPause(false),
+    play: () => { lockAudioPlay(); return togglePlayPause(true); },
+    pause: () => { lockAudioIdleSoon(true); return togglePlayPause(false); },
     previoustrack: skipPrevious,
     nexttrack: skipNext,
     seekto: details => seekToMs(Math.round((details.seekTime || 0) * 1000)),
