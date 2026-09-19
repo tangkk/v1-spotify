@@ -1218,6 +1218,7 @@ let sdkPlayerReady = false;
 let sdkPlayerWaiters = [];
 let deviceReadyWaiters = [];
 let playerStateTimer = null;
+let sdkPos = null;   // this device's own last player state: {uri, position, duration, paused, at}
 
 function initSDK() {
   window.onSpotifyWebPlaybackSDKReady = () => {
@@ -1238,7 +1239,10 @@ function initSDK() {
     player.addListener('not_ready', () => { state.deviceId = null; });
     // Fires on every track change/pause/seek, including with the page in the
     // background where the 5s setInterval is throttled: keep the lock screen current.
-    player.addListener('player_state_changed', () => {
+    player.addListener('player_state_changed', st => {
+      const cur = st && st.track_window && st.track_window.current_track;
+      sdkPos = cur ? {uri: cur.uri, position: st.position, duration: st.duration, paused: st.paused, at: Date.now()} : null;
+      updateMediaPosition();
       clearTimeout(playerStateTimer);
       playerStateTimer = setTimeout(pollNowPlaying, 300);
     });
@@ -2097,12 +2101,15 @@ let lockAudio = null;
 let lockAudioIdleTimer = null;
 
 function silentWavUrl() {
-  const rate = 8000, samples = rate * 2, buf = new ArrayBuffer(44 + samples * 2), v = new DataView(buf);
+  // 5 minutes of 8 kHz 8-bit mono (2.4 MB): the element's own timeline is what
+  // iOS shows when it ignores setPositionState, so it must rarely wrap to 0.
+  const rate = 8000, samples = rate * 300, buf = new ArrayBuffer(44 + samples), v = new DataView(buf);
   const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
-  str(0, 'RIFF'); v.setUint32(4, 36 + samples * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  str(0, 'RIFF'); v.setUint32(4, 36 + samples, true); str(8, 'WAVE'); str(12, 'fmt ');
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  str(36, 'data'); v.setUint32(40, samples * 2, true);   // sample bytes stay 0: silence
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  str(36, 'data'); v.setUint32(40, samples, true);
+  new Uint8Array(buf, 44).fill(0x80);   // unsigned 8-bit: 0x80 is silence
   return URL.createObjectURL(new Blob([buf], {type: 'audio/wav'}));
 }
 
@@ -2112,6 +2119,15 @@ function getLockAudio() {
     lockAudio = new Audio(silentWavUrl());
     lockAudio.loop = true;
     lockAudio.setAttribute('playsinline', '');
+    let lastAssert = 0;
+    // The element's timeline restarting (its loop, a seek, play after pause)
+    // makes iOS show *its* position; put ours back straight away.
+    for (const ev of ['seeked', 'playing', 'play']) lockAudio.addEventListener(ev, () => updateMediaPosition());
+    lockAudio.addEventListener('timeupdate', () => {
+      if (Date.now() - lastAssert < 1000) return;
+      lastAssert = Date.now();
+      updateMediaPosition();
+    });
   }
   return lockAudio;
 }
@@ -2149,10 +2165,19 @@ const hasMediaSession = 'mediaSession' in navigator && typeof MediaMetadata === 
 let mediaTrackUri = null;
 
 function updateMediaPosition() {
-  if (!hasMediaSession || !npState || !npState.durationMs || !navigator.mediaSession.setPositionState) return;
+  if (!hasMediaSession || !navigator.mediaSession.setPositionState) return;
+  // Prefer this browser's own player state (exact, event-driven) over the
+  // server poll, whose progress lags and can read 0 just after a track change.
+  let src = null;
+  if (sdkPos && sdkPos.duration && (!mediaTrackUri || sdkPos.uri === mediaTrackUri)) {
+    src = {progressMs: sdkPos.position, durationMs: sdkPos.duration, playing: !sdkPos.paused, at: sdkPos.at};
+  } else if (npState && npState.durationMs) {
+    src = npState;
+  }
+  if (!src) return;
   try {
-    const duration = npState.durationMs / 1000;
-    const position = (npState.progressMs + (npState.playing ? Date.now() - npState.at : 0)) / 1000;
+    const duration = src.durationMs / 1000;
+    const position = (src.progressMs + (src.playing ? Date.now() - src.at : 0)) / 1000;
     navigator.mediaSession.setPositionState({duration, playbackRate: 1, position: Math.max(0, Math.min(position, duration))});
   } catch (e) {}
 }
