@@ -1242,8 +1242,15 @@ function initSDK() {
     // background where the 5s setInterval is throttled: keep the lock screen current.
     player.addListener('player_state_changed', st => {
       const cur = st && st.track_window && st.track_window.current_track;
+      const prev = sdkPos;
       sdkPos = cur ? {uri: cur.uri, position: st.position, duration: st.duration, paused: st.paused, at: Date.now()} : null;
-      if (cur && cur.uri !== sdkTrackUri) onSdkTrackChange(cur, st);
+      if (cur && cur.uri !== sdkTrackUri) {
+        onSdkTrackChange(cur, st);
+      } else if (cur && prev && prev.uri === cur.uri) {
+        // A seek (position off the expected line) or a resume restarts the iframe's audio too.
+        const expected = prev.position + (prev.paused ? 0 : Date.now() - prev.at);
+        if (Math.abs(st.position - expected) > 2500 || (prev.paused && !st.paused)) reclaimNowPlaying(cur.uri, st.paused);
+      }
       sdkTrackUri = cur ? cur.uri : null;
       updateMediaPosition();
       clearTimeout(playerStateTimer);
@@ -2078,7 +2085,9 @@ async function seekToMs(position_ms) {
   if (!device_id) return;
   await api('/spotify-api/player/seek?position_ms=' + position_ms + '&device_id=' + encodeURIComponent(device_id), {method: 'PUT'});
   if (npState) { npState.progressMs = position_ms; npState.at = Date.now(); }
+  if (sdkPos && sdkPos.uri === mediaTrackUri) { sdkPos.position = position_ms; sdkPos.at = Date.now(); }
   updateMediaPosition();
+  if (mediaTrackUri) reclaimNowPlaying(mediaTrackUri, !(npState && npState.playing));
 }
 progressInput.addEventListener('change', async () => {
   try { await seekToMs(Math.round(Number(progressInput.value))); } finally { draggingProgress = false; }
@@ -2193,11 +2202,33 @@ function applyMediaMetadata(meta) {
   try { navigator.mediaSession.metadata = new MediaMetadata(meta); } catch (e) {}
 }
 
-// When a new track starts, the SDK iframe's audio starts again and iOS gives
-// Now Playing back to it (generic title, no artwork). So on every track change,
-// straight from the SDK event (no server round trip, works in the background):
-// write the metadata, restart the silent element so this page is the most recent
-// player again, and repeat the write a bit later in case iOS updated after us.
+// Whenever the SDK iframe's audio starts again -- a new track, a seek, a
+// resume -- iOS gives Now Playing back to it (generic title, no artwork), and
+// our silent element, which just kept playing, doesn't count as newer. So:
+// restart the silent element so this page is the most recent player again, and
+// re-write the metadata now and a bit later, in case iOS updated after us.
+let reclaimSeq = 0, lastReclaimAt = 0;
+
+function reclaimNowPlaying(uri, paused) {
+  if (!hasMediaSession) return;
+  const seq = ++reclaimSeq;
+  if (mediaMeta) applyMediaMetadata(mediaMeta);
+  if (lockAudio && !lockAudio.paused && !paused && Date.now() - lastReclaimAt > 800) {
+    lastReclaimAt = Date.now();
+    lockAudio.pause();
+    setTimeout(() => { if (!(sdkPos && sdkPos.paused)) lockAudioPlay(); }, 100);   // unless the user paused meanwhile
+  }
+  for (const ms of [1500, 5000]) {
+    setTimeout(() => {
+      if (seq !== reclaimSeq || mediaTrackUri !== uri || !mediaMeta) return;   // a newer reclaim/track took over
+      applyMediaMetadata(mediaMeta);
+      updateMediaPosition();
+    }, ms);
+  }
+}
+
+// A new track: take the metadata straight from the SDK event (no server round
+// trip, works in the background), then reclaim.
 function onSdkTrackChange(cur, st) {
   if (!hasMediaSession) return;
   const images = (cur.album && cur.album.images) || [];
@@ -2206,17 +2237,7 @@ function onSdkTrackChange(cur, st) {
     title: cur.name || '', artist: (cur.artists || []).map(a => a.name).join(', '), album: (cur.album && cur.album.name) || '',
     artwork: images.map(i => ({src: i.url, sizes: (i.width || 640) + 'x' + (i.height || 640), type: 'image/jpeg'})),
   });
-  if (lockAudio && !lockAudio.paused && !st.paused) {
-    lockAudio.pause();
-    setTimeout(() => { if (mediaTrackUri === cur.uri) lockAudioPlay(); }, 100);
-  }
-  for (const ms of [1500, 5000]) {
-    setTimeout(() => {
-      if (mediaTrackUri !== cur.uri || !mediaMeta) return;
-      applyMediaMetadata(mediaMeta);
-      updateMediaPosition();
-    }, ms);
-  }
+  reclaimNowPlaying(cur.uri, st.paused);
 }
 
 function updateMediaSession(np) {
