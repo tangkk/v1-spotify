@@ -2182,6 +2182,7 @@ async function toggleViaSdk(st, want) {
   const wantPlay = typeof want === 'boolean' ? want : !playing;
   if (wantPlay === playing) return true;
   setPlayButton(wantPlay);
+  if (wantPlay) await lockAudioStartFirst();
   localPlayIntent = {playing: wantPlay, until: Date.now() + 3000};
   if (npState) npState = Object.assign({}, npState, {progressMs: st.position, at: Date.now(), playing: wantPlay});
   try {
@@ -2366,6 +2367,20 @@ function lockAudioPlay() {
   if (a && a.paused) a.play().then(() => { lockAudioUnlocked = true; }, () => {});
 }
 
+// Before an instant SDK resume: get the silent element going first and give it
+// a moment. Starting it *after* the music (the poll that follows a resume used
+// to) put a second audio start into the first few hundred ms of playback -- a
+// hiccup, but only when the element had gone idle (paused >15s), so only the
+// first pause/play of a pair showed it.
+async function lockAudioStartFirst() {
+  clearTimeout(lockAudioIdleTimer); lockAudioIdleTimer = null;
+  const a = getLockAudio();
+  if (!a || !a.paused) return;
+  try {
+    await Promise.race([a.play().then(() => { lockAudioUnlocked = true; }), new Promise(r => setTimeout(r, 300))]);
+  } catch (e) {}
+}
+
 // Paused Spotify keeps the silent audio going for a moment: the gap between two
 // tracks briefly reports "not playing", and pausing here would defeat the point.
 function lockAudioIdleSoon(immediately) {
@@ -2419,7 +2434,7 @@ function updateMediaSession(np) {
 
 if (hasMediaSession) {
   const mediaActions = {
-    play: () => { lockAudioPlay(); return togglePlayPause(true); },
+    play: async () => { await lockAudioStartFirst(); return togglePlayPause(true); },
     pause: () => { lockAudioIdleSoon(true); return togglePlayPause(false); },
     previoustrack: skipPrevious,
     nexttrack: skipNext,
