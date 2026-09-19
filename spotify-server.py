@@ -1232,6 +1232,29 @@ SPOTIFY_PAGE = r"""<!doctype html>
   #nowplaying .progress-row .time { font-size:11px; color:#666; font-variant-numeric:tabular-nums; flex:none; min-width:34px; }
   #nowplaying .progress-row .time.start { text-align:left; }
   #nowplaying .progress-row .time.end { text-align:right; }
+  #npLogo { display:none; }
+  /* Full-screen mode: only the current track, centred and enlarged. The bar's
+     own rows are flattened (display:contents) so its parts can be re-ordered
+     into one column: cover/logo, title, progress, controls, volume. */
+  body.fs { overflow:hidden; padding:0; }
+  body.fs header { position:fixed; top:12px; right:12px; z-index:20; margin:0; }
+  body.fs header .logo, body.fs .header-right > :not(#fullscreenButton),
+  body.fs #connectPanel, body.fs #searchPanel, body.fs #view { display:none !important; }
+  body.fs #nowplaying { top:0; border-top:none; padding:56px 20px 32px; gap:clamp(12px, 3vh, 28px);
+                        align-items:center; justify-content:center; z-index:10; overflow:hidden; }
+  body.fs #nowplaying .main-row { display:contents; }
+  body.fs #npCover, body.fs #npLogo { order:1; width:min(72vw, 44vh); height:min(72vw, 44vh); object-fit:cover; }
+  body.fs #npLogo { object-fit:contain; }
+  body.fs #nowplaying .track { order:2; flex:none; width:min(92vw, 720px); text-align:center; }
+  body.fs #nowplaying .track .title { font-size:clamp(22px, 5.5vw, 44px); line-height:1.2; pointer-events:none; }
+  body.fs #nowplaying .track .sub { display:block; font-size:clamp(14px, 3.2vw, 22px); margin-top:8px; }
+  body.fs #nowplaying .progress-row { order:3; width:min(92vw, 720px); gap:12px; }
+  body.fs #nowplaying .progress-row .time { font-size:clamp(13px, 2.6vw, 18px); min-width:46px; }
+  body.fs #nowplaying .controls { order:4; gap:12px; }
+  body.fs #nowplaying .controls button { padding:12px 22px; font-size:clamp(14px, 3vw, 20px); }
+  body.fs #nowplaying .controls button#npPlay { min-width:96px; }
+  body.fs #nowplaying .volume { order:5; }
+  body.fs #nowplaying .volume input[type=range] { width:min(60vw, 260px); }
   @media (max-width: 520px) {
     #nowplaying .track .sub { display:none; }
     #nowplaying .controls button { padding:6px 8px; font-size:11px; }
@@ -1246,6 +1269,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
     <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
+    <button class="icon-btn" id="fullscreenButton" title="Full screen"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M3 7.5V3h4.5M12.5 3H17v4.5M17 12.5V17h-4.5M7.5 17H3v-4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg></button>
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
 </header>
@@ -1268,6 +1292,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <div id="nowplaying">
   <div class="main-row">
     <img id="npCover" class="cover" style="display:none">
+    <img id="npLogo" src="/spotify-api/icon-v2.svg" alt="Spotify">
     <div class="track">
       <div class="title" id="npTitle">-</div>
       <div class="sub" id="npSub"></div>
@@ -1347,6 +1372,15 @@ function applyCoversVisibility() {
     if (state.showCovers && src) { img.src = src; img.style.display = ''; }
     else { img.style.display = 'none'; }
   });
+  syncNpLogo();
+}
+
+// Full-screen mode shows the Spotify logo in the cover's place whenever the
+// cover is off (covers switch) or the track has none.
+function syncNpLogo() {
+  const cover = document.getElementById('npCover');
+  document.getElementById('npLogo').style.display =
+    document.body.classList.contains('fs') && cover.style.display === 'none' ? 'block' : '';
 }
 
 // ---- link status / SDK bootstrap ----
@@ -1785,6 +1819,24 @@ document.getElementById('coversButton').onclick = () => {
   applyCoversVisibility();
 };
 
+// Full-screen mode: CSS-only layout (works on iPhone, where the Fullscreen API
+// is unavailable for pages) plus the browser's real full screen where offered.
+function setFullscreenMode(on) {
+  if (on && document.getElementById('nowplaying').style.display === 'none') { showToast('Nothing playing'); return; }
+  document.body.classList.toggle('fs', on);
+  document.getElementById('fullscreenButton').classList.toggle('active', on);
+  syncNpLogo();
+  try {
+    const de = document.documentElement;
+    if (on && !document.fullscreenElement && de.requestFullscreen) de.requestFullscreen().catch(() => {});
+    else if (!on && document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  } catch (e) {}
+}
+document.getElementById('fullscreenButton').onclick = () => setFullscreenMode(!document.body.classList.contains('fs'));
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && document.body.classList.contains('fs')) setFullscreenMode(false);
+});
+
 // Search is split into three buttons (one Spotify API call each) instead of
 // always querying all three types together, since most searches only care
 // about one of them. Enter repeats whichever type was last used.
@@ -2212,6 +2264,7 @@ async function pollNowPlaying() {
     const cover = document.getElementById('npCover');
     cover.dataset.src = np.track.image || '';
     if (state.showCovers && np.track.image) { cover.src = np.track.image; cover.style.display = ''; } else { cover.style.display = 'none'; }
+    syncNpLogo();
     const npTitle = document.getElementById('npTitle');
     npTitle.textContent = np.track.name;
     npTitle.onclick = np.track.album_id ? (() => goTo({type: 'album', id: np.track.album_id})) : null;
