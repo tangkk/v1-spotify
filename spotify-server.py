@@ -2524,18 +2524,10 @@ function lockAudioIdleSoon(immediately) {
 // ---- Media Session (lock screen / control centre / headset buttons) ----
 // Routes the OS transport buttons through the same functions as the on-page
 // buttons, so they honour V1's queue, and reports the playback position so the
-// lock-screen progress bar tracks the real one. Best effort: each piece is
-// optional per browser.
+// lock-screen progress bar tracks the real one. No metadata (title/artwork) is
+// set. Best effort: each piece is optional per browser.
 const hasMediaSession = 'mediaSession' in navigator && typeof MediaMetadata === 'function';
 let mediaTrackUri = null;
-
-// A fixed, set-once identity (no artwork, no per-track updates -- that whole
-// "reclaim the lock screen from the SDK iframe" approach was tried and dropped:
-// see the git history around 2026-09-19). This exists only because leaving
-// mediaSession.metadata unset seems to make iOS treat the session as a plain
-// scrubbable player and show +-10s skip buttons instead of Previous/Next Track,
-// even with previoustrack/nexttrack handlers registered.
-const LOCKSCREEN_META = {title: 'Spotify', artist: 'V1', album: '', artwork: []};
 
 function updateMediaPosition() {
   if (!hasMediaSession || !navigator.mediaSession.setPositionState) return;
@@ -2572,7 +2564,6 @@ function updateMediaSession(np) {
 }
 
 if (hasMediaSession) {
-  try { navigator.mediaSession.metadata = new MediaMetadata(LOCKSCREEN_META); } catch (e) {}
   const mediaActions = {
     play: async () => { await lockAudioStartFirst(); return togglePlayPause(true); },
     pause: () => { lockAudioIdleSoon(true); return togglePlayPause(false); },
@@ -2582,13 +2573,6 @@ if (hasMediaSession) {
   };
   for (const [action, handler] of Object.entries(mediaActions)) {
     try { navigator.mediaSession.setActionHandler(action, details => Promise.resolve(handler(details)).catch(() => {})); } catch (e) {}
-  }
-  // Explicitly disabled (not just left unset): with previoustrack/nexttrack
-  // registered, iOS should already prefer them, but Safari's lock screen can
-  // still default to showing +-skip buttons unless seekbackward/seekforward
-  // are explicitly nulled out.
-  for (const action of ['seekbackward', 'seekforward']) {
-    try { navigator.mediaSession.setActionHandler(action, null); } catch (e) {}
   }
 }
 
