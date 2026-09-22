@@ -622,7 +622,7 @@ DRIVER_MAX_NAP = 5.0
 AUTO_CAP = 30            # tracks in the auto section
 AUTO_LOW = 15            # topped up back to AUTO_CAP when it shrinks below this while playing
 AUTO_SEEDS = 4           # last manual albums the mix draws from
-AUTO_CHUNK = 3           # tracks taken from a seed per round-robin turn
+AUTO_CHUNK = 6           # tracks taken from a seed per round-robin turn (visible block size per album when several seeds interleave)
 AUTO_ALBUMS_PER_SEED = 3 # following albums a seed may spill into
 
 
