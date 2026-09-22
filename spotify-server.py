@@ -2524,10 +2524,18 @@ function lockAudioIdleSoon(immediately) {
 // ---- Media Session (lock screen / control centre / headset buttons) ----
 // Routes the OS transport buttons through the same functions as the on-page
 // buttons, so they honour V1's queue, and reports the playback position so the
-// lock-screen progress bar tracks the real one. No metadata (title/artwork) is
-// set. Best effort: each piece is optional per browser.
+// lock-screen progress bar tracks the real one. Best effort: each piece is
+// optional per browser.
 const hasMediaSession = 'mediaSession' in navigator && typeof MediaMetadata === 'function';
 let mediaTrackUri = null;
+
+// A fixed, set-once identity (no artwork, no per-track updates -- that whole
+// "reclaim the lock screen from the SDK iframe" approach was tried and dropped:
+// see the git history around 2026-09-19). This exists only because leaving
+// mediaSession.metadata unset seems to make iOS treat the session as a plain
+// scrubbable player and show +-10s skip buttons instead of Previous/Next Track,
+// even with previoustrack/nexttrack handlers registered.
+const LOCKSCREEN_META = {title: 'Spotify', artist: 'V1', album: '', artwork: []};
 
 function updateMediaPosition() {
   if (!hasMediaSession || !navigator.mediaSession.setPositionState) return;
@@ -2564,6 +2572,7 @@ function updateMediaSession(np) {
 }
 
 if (hasMediaSession) {
+  try { navigator.mediaSession.metadata = new MediaMetadata(LOCKSCREEN_META); } catch (e) {}
   const mediaActions = {
     play: async () => { await lockAudioStartFirst(); return togglePlayPause(true); },
     pause: () => { lockAudioIdleSoon(true); return togglePlayPause(false); },
