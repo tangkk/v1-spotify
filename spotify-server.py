@@ -870,6 +870,18 @@ def queue_uncommit(head, kind):
 
 def start_track(track, device_id):
     spotify_api("PUT", "/me/player/play", params={"device_id": device_id}, body={"uris": [track["uri"]]})
+    # This replaces whatever Spotify was about to auto-advance to on its own
+    # (the single track V1 had handed to Spotify's queue in the final 15s of
+    # the previous track) -- that hand-off is now stale. Left alone, it stuck
+    # around in "next" forever (reconcile_queue only clears it once its own
+    # uri starts playing, which never happens once something else is playing
+    # instead), showing at the top of Up Next with no way to remove it (that
+    # row has no delete button, unlike manual/auto items).
+    with _queue_lock:
+        q = load_queue()
+        if q["next"]:
+            q["next"] = None
+            save_queue(q)
 
 
 _driver_seen = None   # last observation of a playing track: {"uri", "at", "remaining_s"}
@@ -3116,6 +3128,19 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("position_ms") is not None:
                 payload["position_ms"] = body["position_ms"]
             spotify_api("PUT", "/me/player/play", params={"device_id": device_id}, body=payload or None)
+            # A play with no position_ms is always a genuinely new starting
+            # point (Recently Played / Dedup rows -- the only frontend caller
+            # of this raw endpoint that skips V1's queue system entirely), so
+            # whatever V1 had handed to Spotify's own queue for the *previous*
+            # track is stale now; clear it the same way start_track() does.
+            # position_ms is only ever sent to resume the very same track
+            # after a reload, where the old hand-off (if any) is still valid.
+            if body.get("position_ms") is None:
+                with _queue_lock:
+                    q = load_queue()
+                    if q["next"]:
+                        q["next"] = None
+                        save_queue(q)
             _driver_wake.set()
             self.send_json(200, {"ok": True}); return
         if path == "/spotify-api/player/pause":
