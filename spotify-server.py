@@ -26,6 +26,9 @@ Routes:
   GET  /spotify-api/search/artists?q=&offset=  -> {"items", "offset", "total", "has_more"}
   GET  /spotify-api/search/albums?q=&offset=
   GET  /spotify-api/search/tracks?q=&offset=
+  GET  /spotify-api/search/best?q=  -> {"kind", "items", "offset", "total", "has_more"} -- one combined
+    Spotify call across all three types; "kind" is whichever type has an exact
+    (case-insensitive) name match at the top, else artist by default.
   GET  /spotify-api/artists/<id>/albums?refresh=1 -- bypass the permanent cache and re-fetch
   GET  /spotify-api/artists/<id>/dedup-tracks
   GET  /spotify-api/albums/<id>?refresh=1          -- bypass the permanent cache and re-fetch
@@ -449,6 +452,35 @@ def spotify_api(method, path, params=None, body=None, retry=True):
                 _token_cache["access_token"] = None
             return spotify_api(method, path, params=params, body=body, retry=False)
         raise SpotifyAPIError(exc.code, exc.read().decode("utf-8", "replace")) from exc
+
+
+def shape_search_items(kind, items):
+    out = []
+    for item in items:
+        if not item:
+            continue
+        if kind == "track":
+            album = item.get("album") or {}
+            images = album.get("images") or []
+            out.append({
+                "id": item["id"], "name": item["name"], "uri": item["uri"],
+                "image": images[0]["url"] if images else None,
+                "artists": [a["name"] for a in item.get("artists", [])],
+                "album_id": album.get("id"), "album_name": album.get("name", ""),
+                "duration_ms": item.get("duration_ms", 0),
+            })
+            continue
+        images = item.get("images") or []
+        entry = {"id": item["id"], "name": item["name"],
+                 "image": images[0]["url"] if images else None, "uri": item["uri"]}
+        if kind == "artist":
+            entry["genres"] = item.get("genres", [])
+        else:
+            entry["artists"] = [a["name"] for a in item.get("artists", [])]
+            entry["release_date"] = item.get("release_date", "")
+            entry["album_type"] = item.get("album_type", "")
+        out.append(entry)
+    return out
 
 
 def cached_search(kind, query, limit, offset=0):
@@ -1865,8 +1897,12 @@ function triggerSearch(kind) {
 document.getElementById('searchArtistButton').onclick = () => triggerSearch('artist');
 document.getElementById('searchAlbumButton').onclick = () => triggerSearch('album');
 document.getElementById('searchTrackButton').onclick = () => triggerSearch('track');
+// Enter doesn't repeat whichever type button was last pressed -- it asks the
+// server for whichever type's top result is an exact name match (falling back
+// to artist), so typing a track or album title and hitting Enter doesn't land
+// on an unrelated artist search.
 document.getElementById('searchInput').addEventListener('keydown', e => {
-  if (e.key === 'Enter') triggerSearch(lastSearchKind);
+  if (e.key === 'Enter') triggerSearch('best');
 });
 
 // searchState holds the current single-type result set plus Spotify's
@@ -1881,10 +1917,13 @@ async function runSearch(query, kind) {
   const err = document.getElementById('searchError');
   err.textContent = '';
   if (!query) return;
-  lastSearchKind = kind;
   try {
-    const result = await api('/spotify-api/search/' + kind + 's?q=' + encodeURIComponent(query));
-    searchState = {query, kind, items: result.items, has_more: result.has_more};
+    const url = kind === 'best' ? '/spotify-api/search/best?q=' + encodeURIComponent(query)
+                                 : '/spotify-api/search/' + kind + 's?q=' + encodeURIComponent(query);
+    const result = await api(url);
+    const resolvedKind = result.kind || kind;   // 'best' resolves to whichever type actually matched
+    lastSearchKind = resolvedKind;
+    searchState = {query, kind: resolvedKind, items: result.items, has_more: result.has_more};
     renderSearchResults();
   } catch (e) { err.textContent = 'Search failed: ' + e.message; }
 }
@@ -2683,6 +2722,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_search("album", query); return
         if path == "/spotify-api/search/tracks":
             self.handle_search("track", query); return
+        if path == "/spotify-api/search/best":
+            self.handle_search_best(query); return
         if path == "/spotify-api/devices":
             self.handle_devices(); return
         if path == "/spotify-api/recently-played":
@@ -2785,32 +2826,28 @@ class Handler(BaseHTTPRequestHandler):
         block = result.get(kind + "s") or {}
         items = block.get("items", [])
         total = block.get("total", len(items))
-        out = []
-        for item in items:
-            if not item:
-                continue
-            if kind == "track":
-                album = item.get("album") or {}
-                images = album.get("images") or []
-                out.append({
-                    "id": item["id"], "name": item["name"], "uri": item["uri"],
-                    "image": images[0]["url"] if images else None,
-                    "artists": [a["name"] for a in item.get("artists", [])],
-                    "album_id": album.get("id"), "album_name": album.get("name", ""),
-                    "duration_ms": item.get("duration_ms", 0),
-                })
-                continue
-            images = item.get("images") or []
-            entry = {"id": item["id"], "name": item["name"],
-                     "image": images[0]["url"] if images else None, "uri": item["uri"]}
-            if kind == "artist":
-                entry["genres"] = item.get("genres", [])
-            else:
-                entry["artists"] = [a["name"] for a in item.get("artists", [])]
-                entry["release_date"] = item.get("release_date", "")
-                entry["album_type"] = item.get("album_type", "")
-            out.append(entry)
+        out = shape_search_items(kind, items)
         self.send_json(200, {"items": out, "offset": offset, "total": total, "has_more": offset + len(items) < total})
+
+    def handle_search_best(self, query):
+        q = (query.get("q", [""])[0] or "").strip()
+        if not q:
+            self.send_json(400, {"error": "missing_query"}); return
+        # One request across all three types (Spotify's /search takes a
+        # comma-separated "type") instead of three -- same cost as a single
+        # regular search. "Most relevant" isn't something Spotify ranks across
+        # types, so this picks whichever type's top result is an exact name
+        # match; with none, it falls back to artist (today's plain-Enter behavior).
+        result = cached_search("artist,album,track", q, SPOTIFY_PAGE_LIMIT)
+        norm = lambda s: re.sub(r"\s+", " ", (s or "").strip()).casefold()
+        qn = norm(q)
+        kind = next((k for k in ("artist", "track", "album")
+                     if norm(((result.get(k + "s") or {}).get("items") or [{}])[0].get("name")) == qn), "artist")
+        block = result.get(kind + "s") or {}
+        items = block.get("items", [])
+        total = block.get("total", len(items))
+        out = shape_search_items(kind, items)
+        self.send_json(200, {"kind": kind, "items": out, "offset": 0, "total": total, "has_more": len(items) < total})
 
     def handle_artist_albums(self, artist_id, query):
         groups = query.get("groups", ["album,single,compilation"])[0]
