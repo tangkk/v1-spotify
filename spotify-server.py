@@ -2574,6 +2574,13 @@ if (hasMediaSession) {
   for (const [action, handler] of Object.entries(mediaActions)) {
     try { navigator.mediaSession.setActionHandler(action, details => Promise.resolve(handler(details)).catch(() => {})); } catch (e) {}
   }
+  // Explicitly disabled (not just left unset): with previoustrack/nexttrack
+  // registered, iOS should already prefer them, but Safari's lock screen can
+  // still default to showing +-skip buttons unless seekbackward/seekforward
+  // are explicitly nulled out.
+  for (const action of ['seekbackward', 'seekforward']) {
+    try { navigator.mediaSession.setActionHandler(action, null); } catch (e) {}
+  }
 }
 
 function renderProgress() {
