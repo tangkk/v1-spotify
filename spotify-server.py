@@ -1496,16 +1496,36 @@ async function refreshDevices() {
 // device involves a fresh WebSocket handshake, auth, and (on some browsers) an
 // EME session negotiation, which can legitimately take several seconds -- this
 // is a one-time cold-start cost, not a retry loop, so it's worth a long wait.
+//
+// Two things used to make the "no device" alert fire even though a device was
+// about to come online a moment later:
+// - if the sdk.scdn.co script itself was still loading (slow network, cold
+//   cache), ensureAudioUnlocked()'s own 5s wait for it could time out without
+//   ever calling connect() -- sdkConnectTriggered stayed false, so this went
+//   straight to a single devices lookup with no wait at all;
+// - once connect() *was* called and the local 'ready' event hadn't fired
+//   within the wait, this fell through to exactly one /spotify-api/devices
+//   call; Spotify's own device registry can lag a beat behind this device
+//   actually finishing its handshake, so that single snapshot could still
+//   miss it.
+// Both are given a further chance below before concluding there's truly
+// nothing to play through.
 async function ensureDevice() {
   if (state.deviceId) return state.deviceId;
+  if (!sdkConnectTriggered) await ensureAudioUnlocked();   // the script may have only just finished loading
   if (sdkConnectTriggered) {
-    const id = await waitForDeviceReady(12000);
+    const id = await waitForDeviceReady(15000);
     if (id) return id;
   }
-  await refreshDevices();
-  const active = state.devices.find(d => d.is_active) || state.devices[0];
-  if (!active) { alert('No available Spotify device. Please try again, or open Spotify on your phone/computer.'); return null; }
-  return active.id;
+  showToast('Connecting to Spotify…');
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await refreshDevices();
+    const active = state.devices.find(d => d.is_active) || state.devices[0];
+    if (active) return active.id;
+    if (attempt < 3) await new Promise(r => setTimeout(r, 1500));
+  }
+  alert('No available Spotify device. Please try again, or open Spotify on your phone/computer.');
+  return null;
 }
 
 async function playUris(uris, contextUri, offset) {
@@ -2536,10 +2556,20 @@ function lockAudioIdleSoon(immediately) {
 // ---- Media Session (lock screen / control centre / headset buttons) ----
 // Routes the OS transport buttons through the same functions as the on-page
 // buttons, so they honour V1's queue, and reports the playback position so the
-// lock-screen progress bar tracks the real one. No metadata (title/artwork) is
-// set. Best effort: each piece is optional per browser.
+// lock-screen progress bar tracks the real one. Best effort: each piece is
+// optional per browser.
 const hasMediaSession = 'mediaSession' in navigator && typeof MediaMetadata === 'function';
 let mediaTrackUri = null;
+
+// A fixed, set-once identity (no artwork, no per-track updates -- the whole
+// "reclaim the lock screen from the SDK iframe" approach was tried and
+// dropped, see the git history around 2026-09-19). Brought back 2026-09-22:
+// with mediaSession.metadata left unset entirely, iOS seemed to stop treating
+// the page as a real background media session at all -- not just showing the
+// wrong transport buttons (a separate, still-unsolved problem), but actually
+// suspending playback on lock. This alone, not the button layout, is why it's
+// here again.
+const LOCKSCREEN_META = {title: 'Spotify', artist: 'V1', album: '', artwork: []};
 
 function updateMediaPosition() {
   if (!hasMediaSession || !navigator.mediaSession.setPositionState) return;
@@ -2576,6 +2606,7 @@ function updateMediaSession(np) {
 }
 
 if (hasMediaSession) {
+  try { navigator.mediaSession.metadata = new MediaMetadata(LOCKSCREEN_META); } catch (e) {}
   const mediaActions = {
     play: async () => { await lockAudioStartFirst(); return togglePlayPause(true); },
     pause: () => { lockAudioIdleSoon(true); return togglePlayPause(false); },
