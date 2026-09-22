@@ -623,7 +623,9 @@ AUTO_CAP = 30            # tracks in the auto section
 AUTO_LOW = 15            # topped up back to AUTO_CAP when it shrinks below this while playing
 AUTO_SEEDS = 4           # last manual albums the mix draws from
 AUTO_CHUNK = 6           # tracks taken from a seed per round-robin turn (visible block size per album when several seeds interleave)
-AUTO_ALBUMS_PER_SEED = 3 # following albums a seed may spill into
+AUTO_ALBUMS_PER_SEED = 3      # following albums a seed always spills into, regardless of how many tracks that finds
+AUTO_ALBUMS_PER_SEED_MAX = 10 # ...and keeps going up to this many if it still hasn't, e.g. an artist who releases singles (1 track/album) -- a fixed album count alone starves those; capped so a very long run of singles can't turn one seed into an unbounded artist-albums walk
+AUTO_SEED_TRACK_TARGET = 12   # "still hasn't": fewer than this many tracks collected from albums after the seed
 
 
 def load_queue():
@@ -669,13 +671,19 @@ def auto_stream(seed):
         start = uris.index(uri) + 1 if uri in uris else len(tracks)
         yield from album_track_summaries(album, tracks[start:])
         artists = album.get("artists") or []
+        if not artists:
+            return
         current, current_date = album_id, album.get("release_date")
-        for _ in range(AUTO_ALBUMS_PER_SEED if artists else 0):
+        collected, walked = 0, 0
+        while walked < AUTO_ALBUMS_PER_SEED_MAX and (walked < AUTO_ALBUMS_PER_SEED or collected < AUTO_SEED_TRACK_TARGET):
             nxt = find_next_album_for_artist(artists[0]["id"], album.get("album_type", "album"),
                                               current, current_date)
             if not nxt:
                 return
-            yield from album_track_summaries(fetch_album_meta(nxt["id"]), fetch_album_tracks(nxt["id"]))
+            walked += 1
+            nxt_tracks = album_track_summaries(fetch_album_meta(nxt["id"]), fetch_album_tracks(nxt["id"]))
+            collected += len(nxt_tracks)
+            yield from nxt_tracks
             current, current_date = nxt["id"], nxt.get("release_date")
     except SpotifyAPIError:
         return  # e.g. the artists/albums quota: keep what was found, don't fail the caller
