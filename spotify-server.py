@@ -46,7 +46,7 @@ Routes:
   POST /spotify-api/queue/remove      {"list": "manual"|"auto", "index", "uri"}
   POST /spotify-api/queue/play-track  {"track", "device_id"} -- play now; album remainder becomes auto (when on)
   POST /spotify-api/queue/play-album  {"album_id", "device_id"} -- play now; the rest of the album becomes the whole (manual) queue, replacing the old one
-  POST /spotify-api/queue/play-albums {"album_ids": [...], "device_id"} -- same for a list of albums in that order (one long queue, capped at PLAY_ALBUMS_MAX_TRACKS)
+  POST /spotify-api/queue/play-albums {"album_ids": [...], "device_id", "shuffle_tracks"?} -- same for a list of albums in that order (one long queue, capped at PLAY_ALBUMS_MAX_TRACKS); shuffle_tracks: true shuffles all their tracks together instead (a single album: shuffle that album)
   POST /spotify-api/queue/play-tracks  {"tracks": [...], "device_id"} -- same, but for already-known track objects (favorite tracks list) instead of looking albums up
   POST /spotify-api/queue/clear       -- empty the manual and auto sections (the track already handed to Spotify stays: Spotify can't take it back)
   POST /spotify-api/queue/next        {"device_id"} -- play the queue head (else Spotify's own next)
@@ -1532,9 +1532,9 @@ SPOTIFY_PAGE = r"""<!doctype html>
   <div class="header-right">
     <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+    <button class="icon-btn" id="favoriteArtistsButton" title="Favorite artists"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="6.8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 17c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="favoriteTracksButton" title="Favorite tracks"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
-    <button class="icon-btn" id="favoriteArtistsButton" title="Favorite artists"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="6.8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 17c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="fullscreenButton" title="Full screen"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M3 7.5V3h4.5M12.5 3H17v4.5M17 12.5V17h-4.5M7.5 17H3v-4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg></button>
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
@@ -1851,13 +1851,13 @@ async function playAlbumNow(albumId) {
 // Plays a list of albums in the order given as one long queue: the first track
 // now, everything after it (the rest of that album, then the following albums)
 // as the manual queue.
-async function playAlbumsNow(albumIds) {
+async function playAlbumsNow(albumIds, shuffleTracks) {
   await ensureAudioUnlocked();
   const device_id = await ensureDevice();
   if (!device_id) return;
   try {
     const r = await api('/spotify-api/queue/play-albums', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({album_ids: albumIds, device_id})});
+      body: JSON.stringify({album_ids: albumIds, device_id, shuffle_tracks: !!shuffleTracks})});
     showToast(r.tracks + ' tracks from ' + r.albums + ' albums queued' + (r.truncated ? ' (first ' + r.tracks + ' only)' : ''));
   } catch (err) { showToast('Could not play: ' + err.message); }
   pollNowPlaying();
@@ -2231,6 +2231,19 @@ function renderFavoritesView() {
     meta.appendChild(el('div', 'sub', (a.artists || []).join(', ') + (year ? ' · ' + year : '')));
     meta.onclick = () => goTo({type: 'album', id: a.id});
     li.appendChild(meta);
+    // Same three buttons as a favorite artist's row: play this album, shuffle
+    // its tracks, un-favorite it.
+    const playOne = iconButton(ICON_PLAY, 'Play ' + a.name, 'icon-btn active');
+    playOne.onclick = () => playAlbumsNow([a.id], false);
+    const shuffleOne = iconButton(ICON_SHUFFLE, 'Shuffle-play ' + a.name);
+    shuffleOne.onclick = () => playAlbumsNow([a.id], true);
+    const unfavBtn = iconButton(ICON_STAR, 'Remove from favorites', 'icon-btn active');
+    unfavBtn.onclick = async () => {
+      await api('/spotify-api/favorites/' + a.id, {method: 'DELETE'});
+      favoritesState = favoritesState.filter(x => x.id !== a.id);
+      renderFavoritesView();
+    };
+    for (const b of [playOne, shuffleOne, unfavBtn]) li.appendChild(b);
     const tags = el('div', 'genre-tags');
     for (const g of COMMON_GENRES) {
       const active = (a.genres || []).includes(g);
@@ -3831,6 +3844,8 @@ class Handler(BaseHTTPRequestHandler):
                 albums += 1
         truncated = truncated or len(tracks) > PLAY_ALBUMS_MAX_TRACKS
         tracks = tracks[:PLAY_ALBUMS_MAX_TRACKS]
+        if body.get("shuffle_tracks"):
+            random.shuffle(tracks)     # every track of the given albums in random order (one album = shuffle that album)
         if not tracks:
             self.send_json(404, {"error": "empty_albums"}); return
         start_track(tracks[0], body.get("device_id"))
