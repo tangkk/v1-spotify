@@ -2480,6 +2480,17 @@ function renderArtistFavoritesView() {
       (a.track_count ? a.track_count + ' favorite track' + (a.track_count === 1 ? '' : 's') : 'no favorite tracks yet')));
     meta.onclick = () => goTo({type: 'artist', id: a.id, name: a.name});
     li.appendChild(meta);
+    // Just this artist: their favorited music in order / shuffled. Nothing to
+    // play when none of it is favorited yet, so the buttons are disabled then.
+    const playOne = iconButton(ICON_PLAY, 'Play ' + a.name, 'icon-btn active');
+    playOne.onclick = () => playArtistsNow([a.id], false);
+    const shuffleOne = iconButton(ICON_SHUFFLE, 'Shuffle-play ' + a.name);
+    shuffleOne.onclick = () => playArtistsNow([a.id], true);
+    if (!a.track_count) {
+      for (const b of [playOne, shuffleOne]) { b.disabled = true; b.title = a.name + ' has no favorite tracks yet'; }
+    }
+    li.appendChild(playOne);
+    li.appendChild(shuffleOne);
     const unfavBtn = iconButton(ICON_PERSON, 'Remove from favorite artists', 'icon-btn active');
     unfavBtn.onclick = async () => {
       await api('/spotify-api/favorite-artists/' + a.id, {method: 'DELETE'});
