@@ -303,21 +303,31 @@ def clear_account():
     clear_last_playback()
 
 
+# The user's own listening skews Jazz heavily enough that it's the sane
+# default tag on anything newly favorited (album or track) -- one less tap for
+# the common case, and it's still just a starting point: the genre chips are
+# editable immediately, and re-favoriting something already in the table never
+# touches its existing tags (the ON CONFLICT clauses below don't set genres at
+# all), so this only ever applies once, on first favorite.
+DEFAULT_FAVORITE_GENRES = ["Jazz"]
+
+
 def add_favorite(album_id, name, artists, image, album_type=None, release_date=None, tracks=None):
     # tracks (and album_type/release_date) are optional: favoriting from the
     # album page sends the full detail already on screen so no extra Spotify
     # call is needed, but COALESCE keeps any previously-cached tracks intact
     # if a caller ever re-favorites without that data (e.g. an older client).
     with db() as conn:
-        conn.execute("""INSERT INTO favorite_albums(id, name, artists, image, album_type, release_date, tracks, added_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        conn.execute("""INSERT INTO favorite_albums(id, name, artists, image, album_type, release_date, tracks, genres, added_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT(id) DO UPDATE SET
                              name=excluded.name, artists=excluded.artists, image=excluded.image,
                              album_type=COALESCE(excluded.album_type, favorite_albums.album_type),
                              release_date=COALESCE(excluded.release_date, favorite_albums.release_date),
                              tracks=COALESCE(excluded.tracks, favorite_albums.tracks)""",
                      (album_id, name, json.dumps(artists or []), image, album_type, release_date,
-                      json.dumps(tracks) if tracks is not None else None, int(time.time())))
+                      json.dumps(tracks) if tracks is not None else None,
+                      json.dumps(DEFAULT_FAVORITE_GENRES), int(time.time())))
         conn.commit()
 
 
@@ -381,15 +391,15 @@ def get_favorite_album_detail(album_id):
 # as-is for both.
 def add_favorite_track(track_id, uri, name, artists, image, album_id, album_name, release_date, duration_ms):
     with db() as conn:
-        conn.execute("""INSERT INTO favorite_tracks(id, uri, name, artists, image, album_id, album_name, release_date, duration_ms, added_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        conn.execute("""INSERT INTO favorite_tracks(id, uri, name, artists, image, album_id, album_name, release_date, duration_ms, genres, added_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT(id) DO UPDATE SET
                              uri=excluded.uri, name=excluded.name, artists=excluded.artists, image=excluded.image,
                              album_id=excluded.album_id, album_name=excluded.album_name,
                              release_date=COALESCE(excluded.release_date, favorite_tracks.release_date),
                              duration_ms=excluded.duration_ms""",
                      (track_id, uri, name, json.dumps(artists or []), image, album_id, album_name, release_date,
-                      int(duration_ms or 0), int(time.time())))
+                      int(duration_ms or 0), json.dumps(DEFAULT_FAVORITE_GENRES), int(time.time())))
         conn.commit()
 
 
