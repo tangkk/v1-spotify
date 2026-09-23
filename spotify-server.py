@@ -1426,8 +1426,10 @@ function iconButton(svg, title, cls) {
 
 const ICON_PLUS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 // Arrow pointing up = ascending (smallest first), down = descending.
-const ICON_SORT_ASC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16V4M5 9l5-5 5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-const ICON_SORT_DESC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 4v12M5 11l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+// One fixed icon for both directions (a straight shaft, arrowhead at each end
+// pointing its own way) instead of swapping between two separate glyphs --
+// the current direction is conveyed by the title tooltip, not the icon.
+const ICON_SORT_UPDOWN = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v14M6.5 7l3.5-4 3.5 4M6.5 13l3.5 4 3.5-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_TRASH = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M4 5.5h12M8 5.5V3.5h4v2M5.5 5.5l.8 11h7.4l.8-11M8.5 9v4.5M11.5 9v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_MORE = '<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="4.5" cy="10" r="1.5" fill="currentColor"/><circle cx="10" cy="10" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10" r="1.5" fill="currentColor"/></svg>';
 const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
@@ -1953,7 +1955,7 @@ function renderFavoritesView() {
     renderFavoritesView();
   }));
   const dir = favoritesDirs[favoritesOrder];
-  const dirBtn = iconButton(dir === 'asc' ? ICON_SORT_ASC : ICON_SORT_DESC,
+  const dirBtn = iconButton(ICON_SORT_UPDOWN,
     dir === 'asc' ? 'Ascending (click for descending)' : 'Descending (click for ascending)');
   dirBtn.onclick = () => {
     favoritesDirs[favoritesOrder] = dir === 'asc' ? 'desc' : 'asc';
@@ -2074,7 +2076,7 @@ function renderTrackFavoritesView() {
     renderTrackFavoritesView();
   }));
   const dir = trackFavoritesDirs[trackFavoritesOrder];
-  const dirBtn = iconButton(dir === 'asc' ? ICON_SORT_ASC : ICON_SORT_DESC,
+  const dirBtn = iconButton(ICON_SORT_UPDOWN,
     dir === 'asc' ? 'Ascending (click for descending)' : 'Descending (click for ascending)');
   dirBtn.onclick = () => {
     trackFavoritesDirs[trackFavoritesOrder] = dir === 'asc' ? 'desc' : 'asc';
