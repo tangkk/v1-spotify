@@ -47,6 +47,7 @@ Routes:
   POST /spotify-api/queue/play-track  {"track", "device_id"} -- play now; album remainder becomes auto (when on)
   POST /spotify-api/queue/play-album  {"album_id", "device_id"} -- play now; the rest of the album becomes the whole (manual) queue, replacing the old one
   POST /spotify-api/queue/play-albums {"album_ids": [...], "device_id"} -- same for a list of albums in that order (one long queue, capped at PLAY_ALBUMS_MAX_TRACKS)
+  POST /spotify-api/queue/play-tracks  {"tracks": [...], "device_id"} -- same, but for already-known track objects (favorite tracks list) instead of looking albums up
   POST /spotify-api/queue/clear       -- empty the manual and auto sections (the track already handed to Spotify stays: Spotify can't take it back)
   POST /spotify-api/queue/next        {"device_id"} -- play the queue head (else Spotify's own next)
   PUT  /spotify-api/queue-settings    {"autoplay": bool} -- off drops the auto section, on recomputes it
@@ -668,6 +669,7 @@ def track_summary(t):
             "image": images[0]["url"] if images else None,
             "artists": [a["name"] for a in t.get("artists", [])],
             "album_id": album.get("id"), "album_name": album.get("name", ""),
+            "release_date": album.get("release_date", ""),
             "duration_ms": t.get("duration_ms", 0)}
 
 
@@ -1279,6 +1281,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
   #nowplaying .track .title:hover { text-decoration:underline; }
   #nowplaying .track .sub { font-size:11px; color:#666; }
   #nowplaying .controls { display:flex; align-items:center; gap:6px; flex:none; }
+  /* Not shown in the compact bar (kept deliberately plain there); fullscreen has room. */
+  #nowplaying .controls #npFavorite { display:none; }
   #nowplaying .volume { display:flex; align-items:center; flex:none; }
   #nowplaying .volume input[type=range] { width:70px; accent-color:#000; }
   #nowplaying .progress-row { display:flex; align-items:center; gap:8px; order:-1; }
@@ -1305,6 +1309,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
   body.fs #nowplaying .progress-row { order:3; width:min(92vw, 720px); gap:12px; }
   body.fs #nowplaying .progress-row .time { font-size:clamp(13px, 2.6vw, 18px); min-width:46px; }
   body.fs #nowplaying .controls { order:4; gap:12px; }
+  body.fs #nowplaying .controls #npFavorite { display:inline-flex; }
   body.fs #nowplaying .controls .icon-btn { width:clamp(48px, 11vw, 64px); height:clamp(48px, 11vw, 64px); }
   body.fs #nowplaying .controls .icon-btn svg { width:52%; height:52%; }
   body.fs #nowplaying .volume { order:5; }
@@ -1322,7 +1327,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
     <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
-    <button class="icon-btn" id="favoriteTracksButton" title="Favorite tracks"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="6.5" cy="15" r="2.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.8 15V4.5L15 3v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
+    <button class="icon-btn" id="favoriteTracksButton" title="Favorite tracks"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="fullscreenButton" title="Full screen"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M3 7.5V3h4.5M12.5 3H17v4.5M17 12.5V17h-4.5M7.5 17H3v-4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg></button>
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
@@ -1355,6 +1360,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
       <button class="icon-btn" id="npPrev" title="Previous" aria-label="Previous"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 4v12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 4.5v11L8 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
       <button class="icon-btn" id="npPlay" title="Play" aria-label="Play"></button>
       <button class="icon-btn" id="npNext" title="Next" aria-label="Next"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M15 4v12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M4.5 4.5v11L12 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
+      <button class="icon-btn" id="npFavorite" title="Add to favorites" aria-label="Add to favorites"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
     </div>
     <div class="volume">
       <input type="range" id="npVolume" min="0" max="100" value="70">
@@ -1416,6 +1422,10 @@ const ICON_TRASH = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M4 
 const ICON_MORE = '<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="4.5" cy="10" r="1.5" fill="currentColor"/><circle cx="10" cy="10" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10" r="1.5" fill="currentColor"/></svg>';
 const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 const ICON_STAR = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+// Track favorites use a heart, distinct from the star used for album favorites.
+const ICON_HEART = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+// Distinct from the normal play button -- for the separate "shuffle" action.
+const ICON_SHUFFLE = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M2.5 6h3l8 7h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 14h3l8-8h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 4l2.5 2-2.5 2M14.5 12l2.5 2-2.5 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // Row action buttons (play / add to queue / remove) are the same 38px icon
 // buttons as the header and the transport bar.
@@ -1641,6 +1651,31 @@ async function playAlbumsNow(albumIds) {
     showToast(r.tracks + ' tracks from ' + r.albums + ' albums queued' + (r.truncated ? ' (first ' + r.tracks + ' only)' : ''));
   } catch (err) { showToast('Could not play: ' + err.message); }
   pollNowPlaying();
+}
+
+// Same idea as playAlbumsNow, but for a list of already-known track objects
+// (the favorite tracks list) instead of album ids to look up.
+async function playTracksNow(tracks) {
+  await ensureAudioUnlocked();
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  try {
+    const r = await api('/spotify-api/queue/play-tracks', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tracks, device_id})});
+    showToast(r.tracks + ' tracks queued' + (r.truncated ? ' (first ' + r.tracks + ' only)' : ''));
+  } catch (err) { showToast('Could not play: ' + err.message); }
+  pollNowPlaying();
+}
+
+// Fisher-Yates; never mutates the input (callers pass an already-filtered/
+// sorted array they still render from afterward).
+function shuffled(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 // ---- navigation ----
@@ -1934,6 +1969,9 @@ function renderFavoritesView() {
     const playBtn = iconButton(ICON_PLAY, 'Play these ' + filtered.length + ' albums in this order', 'icon-btn active');
     playBtn.onclick = () => playAlbumsNow(filtered.map(a => a.id));
     filterRow.appendChild(playBtn);
+    const shuffleBtn = iconButton(ICON_SHUFFLE, 'Shuffle-play these ' + filtered.length + ' albums');
+    shuffleBtn.onclick = () => playAlbumsNow(shuffled(filtered).map(a => a.id));
+    filterRow.appendChild(shuffleBtn);
   }
 
   const list = el('ul', 'list');
@@ -2047,6 +2085,16 @@ function renderTrackFavoritesView() {
     return true;
   });
 
+  if (filtered.length) {
+    // Plays what is listed below, in the order it is listed (current filters and sort).
+    const playBtn = iconButton(ICON_PLAY, 'Play these ' + filtered.length + ' tracks in this order', 'icon-btn active');
+    playBtn.onclick = () => playTracksNow(filtered);
+    filterRow.appendChild(playBtn);
+    const shuffleBtn = iconButton(ICON_SHUFFLE, 'Shuffle-play these ' + filtered.length + ' tracks');
+    shuffleBtn.onclick = () => playTracksNow(shuffled(filtered));
+    filterRow.appendChild(shuffleBtn);
+  }
+
   const list = el('ul', 'list');
   if (!filtered.length) {
     list.appendChild(el('li', 'empty', trackFavoritesState.length ? 'No favorite tracks match these filters' : 'No favorite tracks yet'));
@@ -2063,7 +2111,7 @@ function renderTrackFavoritesView() {
     li.appendChild(meta);
     li.appendChild(playRowButton(playFromHere));
     li.appendChild(queueButton(t));
-    const unfavBtn = iconButton(ICON_STAR, 'Remove from favorites', 'icon-btn active');
+    const unfavBtn = iconButton(ICON_HEART, 'Remove from favorites', 'icon-btn active');
     unfavBtn.onclick = async () => {
       await api('/spotify-api/favorite-tracks/' + t.id, {method: 'DELETE'});
       trackFavoritesState = trackFavoritesState.filter(x => x.id !== t.id);
@@ -2205,6 +2253,39 @@ function showToast(message) {
   setTimeout(() => toast.remove(), 2200);
 }
 
+// A track's own favorite heart, independent of whether its album is
+// favorited (separate store, see the backend endpoint docs). `favorited` is
+// the caller's already-known initial state -- checking is a local sqlite
+// lookup with no Spotify cost, so callers rendering a whole list of rows
+// fetch all of them up front in parallel rather than each button checking
+// for itself and flashing in a moment later. `t` must carry everything
+// favorite-tracks needs to store (uri/name/artists/image/album_id/
+// album_name/release_date/duration_ms) -- exactly the shape trackRow()
+// already expects its rows to have.
+function trackFavoriteButton(t, favorited) {
+  const btn = iconButton(ICON_HEART, favorited ? 'Remove from favorites' : 'Add to favorites');
+  let isFav = !!favorited;
+  const sync = () => {
+    btn.classList.toggle('active', isFav);
+    btn.title = isFav ? 'Remove from favorites' : 'Add to favorites';
+  };
+  sync();
+  btn.onclick = async e => {
+    e.stopPropagation();
+    isFav = !isFav;
+    sync();
+    if (isFav) {
+      await api('/spotify-api/favorite-tracks/' + t.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uri: t.uri, name: t.name, artists: t.artists, image: t.image,
+                               album_id: t.album_id, album_name: t.album_name,
+                               release_date: t.release_date, duration_ms: t.duration_ms})});
+    } else {
+      await api('/spotify-api/favorite-tracks/' + t.id, {method: 'DELETE'});
+    }
+  };
+  return btn;
+}
+
 function queueButton(track, onDone) {
   const btn = iconButton(ICON_PLUS, 'Add to queue');
   btn.onclick = async e => {
@@ -2222,14 +2303,21 @@ function queueButton(track, onDone) {
   return btn;
 }
 
-function trackRow(t, actionBtn) {
+function trackRow(t, actionBtn, opts) {
   // Start the track's own album context at this track, same continuation
   // behavior as every other play entry point in the app.
   const playFromHere = () => playTrackNow(t);
   const li = el('li');
   li.appendChild(coverImg(t.image));
   const meta = el('div', 'meta');
-  meta.appendChild(el('div', 'title', t.name));
+  const title = el('div', 'title', t.name);
+  // Opt-in per call site (Recently Played) rather than the trackRow default,
+  // so the queue page's rows (also built from trackRow) are unaffected.
+  if (opts && opts.titleLinksToAlbum && t.album_id) {
+    title.classList.add('link');
+    title.onclick = e => { e.stopPropagation(); goTo({type: 'album', id: t.album_id}); };
+  }
+  meta.appendChild(title);
   meta.appendChild(el('div', 'sub', t.artists.join(', ') + ' · ' + t.album_name + ' · ' + fmtDuration(t.duration_ms)));
   meta.onclick = playFromHere;
   li.appendChild(meta);
@@ -2243,17 +2331,23 @@ async function loadRecentlyPlayed() {
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const {items} = await api('/spotify-api/recently-played');
-    renderRecentlyPlayedView(items);
+    // Local sqlite lookups (no Spotify cost), so fetching every row's
+    // favorite state up front and in parallel is cheap -- same pattern as
+    // the album page's per-track stars.
+    const favStates = await Promise.all(items.map(t =>
+      api('/spotify-api/favorite-tracks/' + t.id).catch(() => ({favorited: false}))));
+    renderRecentlyPlayedView(items, favStates);
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
-function renderRecentlyPlayedView(items) {
+function renderRecentlyPlayedView(items, favStates) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   view.appendChild(el('h2', null, 'Recently Played'));
   const list = el('ul', 'list');
   if (!items.length) list.appendChild(el('li', 'empty', 'Nothing played yet'));
-  for (const t of items) list.appendChild(trackRow(t));
+  items.forEach((t, i) => list.appendChild(trackRow(t, [queueButton(t), trackFavoriteButton(t, favStates[i] && favStates[i].favorited)],
+                                                     {titleLinksToAlbum: true})));
   view.appendChild(list);
 }
 
@@ -2468,7 +2562,8 @@ async function renderAlbumView(album) {
     // queue), so playback continues through the rest of the album afterward --
     // same continuation behavior as "Play album".
     const summary = {id: t.id, uri: t.uri, name: t.name, image: album.image, artists: t.artists,
-                     album_id: album.id, album_name: album.name, duration_ms: t.duration_ms};
+                     album_id: album.id, album_name: album.name, release_date: album.release_date,
+                     duration_ms: t.duration_ms};
     const playFromHere = () => playTrackNow(summary);
     const li = el('li');
     const meta2 = el('div', 'meta');
@@ -2478,27 +2573,7 @@ async function renderAlbumView(album) {
     li.appendChild(meta2);
     li.appendChild(playRowButton(playFromHere));
     li.appendChild(queueButton(summary));
-    // A track's own favorite status, independent of whether its album is favorited.
-    const trackFavBtn = iconButton(ICON_STAR, 'Add to favorites');
-    let trackFavorited = !!trackFavStates[i].favorited;
-    const syncTrackFavBtn = () => {
-      trackFavBtn.classList.toggle('active', trackFavorited);
-      trackFavBtn.title = trackFavorited ? 'Remove from favorites' : 'Add to favorites';
-    };
-    syncTrackFavBtn();
-    trackFavBtn.onclick = async () => {
-      trackFavorited = !trackFavorited;
-      syncTrackFavBtn();
-      if (trackFavorited) {
-        await api('/spotify-api/favorite-tracks/' + t.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({uri: summary.uri, name: summary.name, artists: summary.artists, image: summary.image,
-                                 album_id: summary.album_id, album_name: summary.album_name,
-                                 release_date: album.release_date, duration_ms: summary.duration_ms})});
-      } else {
-        await api('/spotify-api/favorite-tracks/' + t.id, {method: 'DELETE'});
-      }
-    };
-    li.appendChild(trackFavBtn);
+    li.appendChild(trackFavoriteButton(summary, trackFavStates[i].favorited));
     list.appendChild(li);
   });
   view.appendChild(list);
@@ -2614,6 +2689,38 @@ document.getElementById('npVolume').onchange = async e => {
 // instead of jumping once every 5 seconds.
 let npState = null;
 
+// Fullscreen-only heart for whatever's currently playing (see the CSS above --
+// hidden in the compact bar). Only re-checked when the track actually
+// changes, not on every 5s poll, so it doesn't flash or spam sqlite lookups.
+let npFavTrackUri = null;
+async function syncNpFavoriteButton(track) {
+  const btn = document.getElementById('npFavorite');
+  if (!track || !track.uri) { npFavTrackUri = null; return; }
+  if (track.uri === npFavTrackUri) return;
+  npFavTrackUri = track.uri;
+  const id = track.uri.split(':').pop();
+  let favorited = false;
+  try { const st = await api('/spotify-api/favorite-tracks/' + id); favorited = !!st.favorited; } catch (e) {}
+  if (track.uri !== npFavTrackUri) return;   // a newer track took over while this was in flight
+  const sync = fav => {
+    btn.classList.toggle('active', fav);
+    btn.title = fav ? 'Remove from favorites' : 'Add to favorites';
+  };
+  sync(favorited);
+  btn.onclick = async () => {
+    favorited = !favorited;
+    sync(favorited);
+    if (favorited) {
+      await api('/spotify-api/favorite-tracks/' + id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uri: track.uri, name: track.name, artists: track.artists, image: track.image,
+                               album_id: track.album_id, album_name: track.album,
+                               release_date: track.release_date, duration_ms: track.duration_ms})});
+    } else {
+      await api('/spotify-api/favorite-tracks/' + id, {method: 'DELETE'});
+    }
+  };
+}
+
 async function pollNowPlaying() {
   try {
     const np = await api('/spotify-api/player/now-playing');
@@ -2639,6 +2746,7 @@ async function pollNowPlaying() {
     npTitle.style.cursor = np.track.album_id ? 'pointer' : '';
     document.getElementById('npSub').textContent = [np.track.artists.join(', '), np.track.album, (np.track.release_date || '').slice(0, 4)].filter(Boolean).join(' · ');
     setPlayButton(np.playing);
+    syncNpFavoriteButton(np.track);
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
     if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
     updateMediaSession(np);
@@ -3286,6 +3394,24 @@ class Handler(BaseHTTPRequestHandler):
         _driver_wake.set()
         self.send_json(200, {"ok": True, "tracks": len(tracks), "albums": albums, "truncated": truncated})
 
+    def handle_queue_play_tracks(self, body):
+        raw = body.get("tracks")
+        if not isinstance(raw, list) or not raw:
+            self.send_json(400, {"error": "invalid_tracks"}); return
+        tracks = [t for t in (clean_track(t) for t in raw) if t][:PLAY_ALBUMS_MAX_TRACKS]
+        if not tracks:
+            self.send_json(400, {"error": "invalid_tracks"}); return
+        start_track(tracks[0], body.get("device_id"))
+        with _queue_lock:
+            q = load_queue()
+            q["manual"] = tracks[1:]   # a new queue: replaces the old manual and auto sections
+            q["auto"] = []
+            q["auto_tried"] = None
+            save_queue(q)
+        refresh_auto((tracks[-1].get("album_id"), tracks[-1]["uri"]))
+        _driver_wake.set()
+        self.send_json(200, {"ok": True, "tracks": len(tracks), "truncated": len(raw) > len(tracks)})
+
     def handle_queue_clear(self, body):
         with _queue_lock:
             q = load_queue()
@@ -3501,6 +3627,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/spotify-api/queue/play-track": self.handle_queue_play_track,
                   "/spotify-api/queue/play-album": self.handle_queue_play_album,
                   "/spotify-api/queue/play-albums": self.handle_queue_play_albums,
+                  "/spotify-api/queue/play-tracks": self.handle_queue_play_tracks,
                   "/spotify-api/queue/clear": self.handle_queue_clear,
                   "/spotify-api/queue/next": self.handle_queue_next}
         if path in routes:
