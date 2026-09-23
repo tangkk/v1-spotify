@@ -489,6 +489,46 @@ def set_favorite_artist_genres(artist_id, genres):
         conn.commit()
 
 
+def fetch_artist_meta(artist_id):
+    """{id, name, images} for an artist, cached permanently (an artist's picture
+    doesn't change in any way this app cares about). Spotify's Dev Mode returns
+    no genres/popularity here, but the images are there."""
+    key = f"artist_meta:{artist_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    a = spotify_api("GET", f"/artists/{artist_id}")
+    meta = {"id": a.get("id"), "name": a.get("name"), "images": a.get("images") or []}
+    cache_set(key, meta)
+    return meta
+
+
+def pick_artist_image(images):
+    """The smallest picture that is still at least 160px wide (shown at ~40px,
+    so the 1000px original would only be wasted bytes), else the largest."""
+    sized = sorted((i for i in (images or []) if i.get("url")), key=lambda i: i.get("width") or 0)
+    good = [i for i in sized if (i.get("width") or 0) >= 160]
+    pick = good[0] if good else (sized[-1] if sized else None)
+    return pick["url"] if pick else None
+
+
+def refresh_artist_image(artist_id):
+    """Replace a favorite artist's stored picture (originally a stand-in album
+    cover) with the artist's own. Best effort: on any Spotify error it stays as is."""
+    try:
+        image = pick_artist_image(fetch_artist_meta(artist_id)["images"])
+    except Exception:
+        return None
+    if image:
+        with db() as conn:
+            conn.execute("UPDATE favorite_artists SET image=? WHERE id=?", (image, artist_id))
+            conn.commit()
+    return image
+
+
+_artist_image_tried = set()   # ids already attempted this process, so a failing lookup isn't retried on every list
+
+
 def favorite_track_pools():
     """{artist name (lowercase): [queue-item tracks]}, oldest release first.
     Built from the favorite albums' cached tracks (in album order) plus the
@@ -529,6 +569,10 @@ def list_favorite_artists():
     with db() as conn:
         rows = conn.execute("SELECT id, name, image, genres, added_at, first_release_date FROM favorite_artists "
                             "ORDER BY added_at DESC").fetchall()
+    for r in rows:      # stand-in album covers -> the artist's own picture, in the background, once
+        if r[0] not in _artist_image_tried and cache_get(f"artist_meta:{r[0]}") is None:
+            _artist_image_tried.add(r[0])
+            threading.Thread(target=refresh_artist_image, args=(r[0],), daemon=True).start()
     # "release_date" here is the artist's earliest album, named the same as on
     # albums/tracks so sortFavorites/eraOf work on all three lists unchanged.
     return [{"id": r[0], "name": r[1], "image": r[2], "genres": json.loads(r[3]) if r[3] else [],
@@ -3976,6 +4020,7 @@ class Handler(BaseHTTPRequestHandler):
             frd = body.get("release_date")
             add_favorite_artist(match.group(1), str(body.get("name", "")), body.get("image"),
                                 frd if isinstance(frd, str) and re.match(r"^\d{4}", frd) else None)
+            refresh_artist_image(match.group(1))   # the client only has an album cover to offer
             self.send_json(200, {"ok": True}); return
         match = FAVORITE_TRACK_RE.match(path)
         if match:
