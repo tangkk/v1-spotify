@@ -63,10 +63,17 @@ Routes:
   PUT    /spotify-api/favorite-tracks/<track_id> {"uri", "name", "artists", "image", "album_id", "album_name", "release_date", "duration_ms"} -- add/update a favorite track, independent of the album's own favorite status
   PUT    /spotify-api/favorite-tracks/<track_id>/genres {"genres": [...]}
   DELETE /spotify-api/favorite-tracks/<track_id>
+  GET    /spotify-api/favorite-artists            -> {"items": [{id, name, image, genres, added_at, track_count}]} (track_count = favorite tracks + favorite albums' tracks by that artist name, all local)
+  GET    /spotify-api/favorite-artists/<artist_id> -> {"favorited": bool}
+  PUT    /spotify-api/favorite-artists/<artist_id> {"name", "image"}
+  PUT    /spotify-api/favorite-artists/<artist_id>/genres {"genres": [...]}
+  DELETE /spotify-api/favorite-artists/<artist_id>
+  POST   /spotify-api/queue/play-artists {"artist_ids": [...], "shuffle": bool, "device_id"} -- play those artists' favorited music as one queue (see build_artist_queue)
 """
 import base64
 import json
 import os
+import random
 import re
 import secrets
 import sqlite3
@@ -103,6 +110,8 @@ ARTIST_DEDUP_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/dedup-
 ALBUM_RE = re.compile(r"^/spotify-api/albums/([A-Za-z0-9]{10,40})$")
 FAVORITE_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})$")
 FAVORITE_GENRES_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})/genres$")
+FAVORITE_ARTIST_RE = re.compile(r"^/spotify-api/favorite-artists/([A-Za-z0-9]{10,40})$")
+FAVORITE_ARTIST_GENRES_RE = re.compile(r"^/spotify-api/favorite-artists/([A-Za-z0-9]{10,40})/genres$")
 FAVORITE_TRACK_RE = re.compile(r"^/spotify-api/favorite-tracks/([A-Za-z0-9]{10,40})$")
 FAVORITE_TRACK_GENRES_RE = re.compile(r"^/spotify-api/favorite-tracks/([A-Za-z0-9]{10,40})/genres$")
 ALBUM_TYPE_RANK = {"album": 3, "single": 2, "compilation": 1, "appears_on": 0}
@@ -223,6 +232,13 @@ def db():
         album_name TEXT,
         release_date TEXT,
         duration_ms INTEGER,
+        genres TEXT,
+        added_at INTEGER NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS favorite_artists (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        image TEXT,
         genres TEXT,
         added_at INTEGER NOT NULL
     )""")
@@ -429,6 +445,112 @@ def is_favorite_track(track_id):
     with db() as conn:
         row = conn.execute("SELECT 1 FROM favorite_tracks WHERE id=?", (track_id,)).fetchone()
     return row is not None
+
+
+# Favorite artists: independent of albums and tracks. There is no artist-level
+# date, so no Year/Era on this list. What "playing an artist" means is decided
+# purely from local data: the favorite tracks and the favorite albums' cached
+# tracks whose artist *name* matches (those tables store names, not ids) --
+# no Spotify call at all.
+def add_favorite_artist(artist_id, name, image):
+    with db() as conn:
+        conn.execute("""INSERT INTO favorite_artists(id, name, image, genres, added_at)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                             image=COALESCE(excluded.image, favorite_artists.image)""",
+                     (artist_id, name, image, json.dumps(DEFAULT_FAVORITE_GENRES), int(time.time())))
+        conn.commit()
+
+
+def remove_favorite_artist(artist_id):
+    with db() as conn:
+        conn.execute("DELETE FROM favorite_artists WHERE id=?", (artist_id,))
+        conn.commit()
+
+
+def is_favorite_artist(artist_id):
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM favorite_artists WHERE id=?", (artist_id,)).fetchone()
+    return row is not None
+
+
+def set_favorite_artist_genres(artist_id, genres):
+    with db() as conn:
+        conn.execute("UPDATE favorite_artists SET genres=? WHERE id=?", (json.dumps(genres), artist_id))
+        conn.commit()
+
+
+def favorite_track_pools():
+    """{artist name (lowercase): [queue-item tracks]}, oldest release first.
+    Built from the favorite albums' cached tracks (in album order) plus the
+    favorite tracks that aren't already part of one of those albums."""
+    entries, seen = [], set()
+    with db() as conn:
+        albums = conn.execute("SELECT id, name, image, artists, release_date, tracks FROM favorite_albums "
+                              "WHERE tracks IS NOT NULL").fetchall()
+        tracks = conn.execute("SELECT id, uri, name, artists, image, album_id, album_name, release_date, duration_ms "
+                              "FROM favorite_tracks").fetchall()
+    for aid, aname, image, artists, rd, raw in albums:
+        album_artists = json.loads(artists or "[]")
+        for pos, t in enumerate(json.loads(raw)):
+            if not t.get("uri") or t["uri"] in seen:
+                continue
+            seen.add(t["uri"])
+            names = [str(a) for a in (t.get("artists") or album_artists)]
+            item = {"id": t.get("id"), "uri": t["uri"], "name": t.get("name", ""), "image": image, "artists": names,
+                    "album_id": aid, "album_name": aname, "duration_ms": int(t.get("duration_ms") or 0)}
+            entries.append(((rd or "9999", aname or "", pos), item))
+    for tid, uri, name, artists, image, album_id, album_name, rd, dur in tracks:
+        if uri in seen:
+            continue
+        seen.add(uri)
+        item = {"id": tid, "uri": uri, "name": name, "image": image, "artists": json.loads(artists or "[]"),
+                "album_id": album_id, "album_name": album_name or "", "duration_ms": int(dur or 0)}
+        entries.append(((rd or "9999", album_name or "", 10 ** 6), item))
+    entries.sort(key=lambda e: e[0])
+    pools = {}
+    for _, item in entries:
+        for n in item["artists"]:
+            pools.setdefault(n.lower(), []).append(item)
+    return pools
+
+
+def list_favorite_artists():
+    pools = favorite_track_pools()
+    with db() as conn:
+        rows = conn.execute("SELECT id, name, image, genres, added_at FROM favorite_artists "
+                            "ORDER BY added_at DESC").fetchall()
+    return [{"id": r[0], "name": r[1], "image": r[2], "genres": json.loads(r[3]) if r[3] else [],
+             "added_at": r[4], "track_count": len(pools.get(r[1].lower(), []))} for r in rows]
+
+
+def build_artist_queue(names, shuffle):
+    """The tracks to queue for these artists (names in the order given).
+    Ordered: one artist after another, each chronologically. Shuffled: every
+    artist's tracks are shuffled, then rounds of one track per artist (artist
+    order re-shuffled every round), so an artist with 300 favorites doesn't
+    drown one with 3. A track by two of the artists is queued once, under the
+    first one that has it. Returns (tracks, artists_with_tracks, artists_without)."""
+    pools, seen, lists, empty = favorite_track_pools(), set(), [], 0
+    for n in names:
+        mine = [t for t in pools.get(n.lower(), []) if t["uri"] not in seen]
+        seen.update(t["uri"] for t in mine)
+        if mine:
+            lists.append(mine)
+        else:
+            empty += 1
+    if not shuffle:
+        tracks = [t for lst in lists for t in lst]
+    else:
+        for lst in lists:
+            random.shuffle(lst)
+        tracks, live = [], list(lists)
+        while live:
+            random.shuffle(live)
+            for lst in live:
+                tracks.append(lst.pop())
+            live = [lst for lst in live if lst]
+    return tracks[:PLAY_ALBUMS_MAX_TRACKS], len(lists), empty
 
 
 # ------------------------------------------------------------- spotify io --
@@ -1235,7 +1357,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
          padding:20px 20px 96px; }
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
   .logo { height:32px; width:32px; display:block; }
-  .header-right { display:flex; align-items:center; gap:10px; }
+  .header-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+  @media (max-width: 420px) { .header-right { gap:6px; } }
   .panel { border:1px solid #000; padding:14px 16px; margin-bottom:20px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .button { padding:8px 16px; border:1px solid #000; background:#fff; color:#000;
@@ -1340,6 +1463,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="favoriteTracksButton" title="Favorite tracks"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
+    <button class="icon-btn" id="favoriteArtistsButton" title="Favorite artists"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="6.8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 17c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="fullscreenButton" title="Full screen"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M3 7.5V3h4.5M12.5 3H17v4.5M17 12.5V17h-4.5M7.5 17H3v-4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg></button>
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
@@ -1435,6 +1559,7 @@ const ICON_SORT_UPDOWN = '<svg width="18" height="18" viewBox="0 0 20 20"><path 
 const ICON_TRASH = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M4 5.5h12M8 5.5V3.5h4v2M5.5 5.5l.8 11h7.4l.8-11M8.5 9v4.5M11.5 9v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_MORE = '<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="4.5" cy="10" r="1.5" fill="currentColor"/><circle cx="10" cy="10" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10" r="1.5" fill="currentColor"/></svg>';
 const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const ICON_PERSON = '<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="6.8" r="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 17c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 const ICON_STAR = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
 // Track favorites use a heart, distinct from the star used for album favorites.
 const ICON_HEART = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>';
@@ -1681,6 +1806,21 @@ async function playTracksNow(tracks) {
   pollNowPlaying();
 }
 
+// Plays these favorite artists' favorited music as one queue (the server builds
+// it from local data: see build_artist_queue). shuffle=false: one artist after
+// another; true: rounds of one track per artist.
+async function playArtistsNow(artistIds, shuffle) {
+  await ensureAudioUnlocked();
+  const device_id = await ensureDevice();
+  if (!device_id) return;
+  try {
+    const r = await api('/spotify-api/queue/play-artists', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({artist_ids: artistIds, shuffle: !!shuffle, device_id})});
+    showToast(r.tracks + ' tracks from ' + r.artists + ' artists queued' + (r.empty ? ' (' + r.empty + ' without favorites skipped)' : ''));
+  } catch (err) { showToast(err.status === 404 ? 'No favorite tracks by these artists yet' : 'Could not play: ' + err.message); }
+  pollNowPlaying();
+}
+
 // Fisher-Yates; never mutates the input (callers pass an already-filtered/
 // sorted array they still render from afterward).
 function shuffled(arr) {
@@ -1709,6 +1849,7 @@ async function renderDescriptor(d) {
   if (d.type === 'dedup') { await loadDedup(d.id, d.name); return; }
   if (d.type === 'favorites') { await loadFavorites(); return; }
   if (d.type === 'favorite-tracks') { await loadFavoriteTracks(); return; }
+  if (d.type === 'favorite-artists') { await loadFavoriteArtists(); return; }
   if (d.type === 'queue') { await loadQueueView(); return; }
 }
 
@@ -1769,6 +1910,7 @@ setInterval(pollViewState, 3000);
 
 document.getElementById('favoritesButton').onclick = () => goTo({type: 'favorites'});
 document.getElementById('favoriteTracksButton').onclick = () => goTo({type: 'favorite-tracks'});
+document.getElementById('favoriteArtistsButton').onclick = () => goTo({type: 'favorite-artists'});
 document.getElementById('recentlyPlayedButton').onclick = () => goTo({type: 'home'});
 document.getElementById('queueViewButton').onclick = () => goTo({type: 'queue'});
 
@@ -2155,6 +2297,119 @@ function renderTrackFavoritesView() {
   view.appendChild(list);
 }
 
+// ---- favorite artists ----
+// Same building blocks as the album/track favorites pages, minus what makes no
+// sense for an artist: no Artist filter (the row *is* the artist) and no
+// Year/Era (an artist has no release date), so only Genre, and order by
+// Recently added or A-Z.
+const ARTIST_FAV_ORDERS = [['added', 'Order: Recently added'], ['alpha', 'Order: A–Z']];
+let artistFavoritesState = null;
+let artistFavoritesGenre = '';
+let artistFavoritesOrder = 'added';
+let artistFavoritesDirs = Object.assign({}, FAV_DEFAULT_DIRS);
+try {
+  const o = localStorage.getItem('spotify_artistfav_order'); if (ARTIST_FAV_ORDERS.some(x => x[0] === o)) artistFavoritesOrder = o;
+  const d = JSON.parse(localStorage.getItem('spotify_artistfav_dirs') || '{}');
+  for (const k of Object.keys(FAV_DEFAULT_DIRS)) if (d[k] === 'asc' || d[k] === 'desc') artistFavoritesDirs[k] = d[k];
+} catch (e) {}
+
+async function loadFavoriteArtists() {
+  const view = document.getElementById('view');
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const {items} = await api('/spotify-api/favorite-artists');
+    artistFavoritesState = items;
+    artistFavoritesGenre = '';
+    renderArtistFavoritesView();
+  } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
+}
+
+function renderArtistFavoritesView() {
+  const view = document.getElementById('view');
+  view.innerHTML = '';
+  const crumbs = el('div', 'crumbs');
+  const back = el('a', null, '← Back'); back.onclick = () => goBack();
+  crumbs.appendChild(back);
+  view.appendChild(crumbs);
+  view.appendChild(el('h2', null, 'Favorite Artists'));
+
+  const filterRow = el('div', 'row');
+  filterRow.style.marginBottom = '14px';
+  filterRow.appendChild(buildFilterSelect(
+    [['', 'All genres'], ...COMMON_GENRES.map(g => [g, g]), [UNTAGGED, 'Untagged']], artistFavoritesGenre,
+    v => { artistFavoritesGenre = v; renderArtistFavoritesView(); }));
+  filterRow.appendChild(buildFilterSelect(ARTIST_FAV_ORDERS, artistFavoritesOrder, v => {
+    artistFavoritesOrder = v;
+    try { localStorage.setItem('spotify_artistfav_order', v); } catch (e) {}
+    renderArtistFavoritesView();
+  }));
+  const dir = artistFavoritesDirs[artistFavoritesOrder];
+  const dirBtn = iconButton(ICON_SORT_UPDOWN,
+    dir === 'asc' ? 'Ascending (click for descending)' : 'Descending (click for ascending)');
+  dirBtn.onclick = () => {
+    artistFavoritesDirs[artistFavoritesOrder] = dir === 'asc' ? 'desc' : 'asc';
+    try { localStorage.setItem('spotify_artistfav_dirs', JSON.stringify(artistFavoritesDirs)); } catch (e) {}
+    renderArtistFavoritesView();
+  };
+  filterRow.appendChild(dirBtn);
+  view.appendChild(filterRow);
+
+  const filtered = sortFavorites(artistFavoritesState, artistFavoritesOrder, artistFavoritesDirs[artistFavoritesOrder]).filter(a => {
+    const genres = a.genres || [];
+    if (artistFavoritesGenre === UNTAGGED) return !genres.length;
+    return !artistFavoritesGenre || genres.includes(artistFavoritesGenre);
+  });
+
+  if (filtered.length) {
+    // In the order listed below / rounds of one track per artist. Artists with no favorited tracks are skipped.
+    const ids = filtered.map(a => a.id);
+    const playBtn = iconButton(ICON_PLAY, 'Play these ' + filtered.length + ' artists in this order', 'icon-btn active');
+    playBtn.onclick = () => playArtistsNow(ids, false);
+    filterRow.appendChild(playBtn);
+    const shuffleBtn = iconButton(ICON_SHUFFLE, 'Shuffle-play these ' + filtered.length + ' artists');
+    shuffleBtn.onclick = () => playArtistsNow(ids, true);
+    filterRow.appendChild(shuffleBtn);
+  }
+
+  const list = el('ul', 'list');
+  if (!filtered.length) {
+    list.appendChild(el('li', 'empty', artistFavoritesState.length ? 'No favorite artists match this filter' : 'No favorite artists yet'));
+  }
+  for (const a of filtered) {
+    const li = el('li', 'fav-item');
+    li.appendChild(coverImg(a.image));
+    const meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', a.name));
+    meta.appendChild(el('div', 'sub', a.track_count ? a.track_count + ' favorite track' + (a.track_count === 1 ? '' : 's')
+                                                     : 'no favorite tracks yet'));
+    meta.onclick = () => goTo({type: 'artist', id: a.id, name: a.name});
+    li.appendChild(meta);
+    const unfavBtn = iconButton(ICON_PERSON, 'Remove from favorite artists', 'icon-btn active');
+    unfavBtn.onclick = async () => {
+      await api('/spotify-api/favorite-artists/' + a.id, {method: 'DELETE'});
+      artistFavoritesState = artistFavoritesState.filter(x => x.id !== a.id);
+      renderArtistFavoritesView();
+    };
+    li.appendChild(unfavBtn);
+    const tags = el('div', 'genre-tags');
+    for (const g of COMMON_GENRES) {
+      const active = (a.genres || []).includes(g);
+      const chip = el('button', active ? 'chip active' : 'chip', g);
+      chip.onclick = async () => {
+        const genres = a.genres || [];
+        a.genres = active ? genres.filter(x => x !== g) : [...genres, g];
+        await api('/spotify-api/favorite-artists/' + a.id + '/genres', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({genres: a.genres})});
+        renderArtistFavoritesView();
+      };
+      tags.appendChild(chip);
+    }
+    li.appendChild(tags);
+    list.appendChild(li);
+  }
+  view.appendChild(list);
+}
+
 // ---- search / browse ----
 
 document.getElementById('coversButton').classList.toggle('active', state.showCovers);
@@ -2391,7 +2646,9 @@ async function loadArtist(id, name, refresh) {
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const albums = await api('/spotify-api/artists/' + id + '/albums' + (refresh ? '?refresh=1' : ''));
-    renderArtistView({id, name, albums: albums.items});
+    let favorited = false;
+    try { favorited = !!(await api('/spotify-api/favorite-artists/' + id)).favorited; } catch (e) {}
+    renderArtistView({id, name, albums: albums.items, favorited});
     if (refresh) showToast('Refreshed');
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
@@ -2408,6 +2665,26 @@ function renderArtistView(artist) {
   const artistTitle = el('h2', null, artist.name);
   artistTitle.style.margin = '0';
   heading.appendChild(artistTitle);
+  // Favorite this artist (independent of albums/tracks). The cover is the
+  // newest album's -- the artist page doesn't carry a picture of its own.
+  const favArtistBtn = iconButton(ICON_PERSON, 'Add to favorite artists');
+  let artistFavorited = !!artist.favorited;
+  const syncFavArtist = () => {
+    favArtistBtn.classList.toggle('active', artistFavorited);
+    favArtistBtn.title = artistFavorited ? 'Remove from favorite artists' : 'Add to favorite artists';
+  };
+  syncFavArtist();
+  favArtistBtn.onclick = async () => {
+    artistFavorited = !artistFavorited;
+    syncFavArtist();
+    if (artistFavorited) {
+      await api('/spotify-api/favorite-artists/' + artist.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: artist.name, image: ((artist.albums || [])[0] || {}).image || null})});
+    } else {
+      await api('/spotify-api/favorite-artists/' + artist.id, {method: 'DELETE'});
+    }
+  };
+  heading.appendChild(favArtistBtn);
   const refreshBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><path d="M15.5 5.5A7 7 0 1 0 17 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 2v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     'Update cache');
   refreshBtn.onclick = () => loadArtist(artist.id, artist.name, true);
@@ -3016,6 +3293,19 @@ setInterval(renderProgress, 250);
 
 # ------------------------------------------------------------------ http --
 
+def replace_queue_and_play(tracks, device_id):
+    """First track plays now; the rest replace the manual queue (and the auto section)."""
+    start_track(tracks[0], device_id)
+    with _queue_lock:
+        q = load_queue()
+        q["manual"] = tracks[1:]   # a new queue: replaces the old manual and auto sections
+        q["auto"] = []
+        q["auto_tried"] = None
+        save_queue(q)
+    refresh_auto((tracks[-1].get("album_id"), tracks[-1]["uri"]))
+    _driver_wake.set()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "V1Spotify/1.0"
 
@@ -3139,6 +3429,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"items": list_favorites()}); return
         if path == "/spotify-api/favorite-tracks":
             self.send_json(200, {"items": list_favorite_tracks()}); return
+        if path == "/spotify-api/favorite-artists":
+            self.send_json(200, {"items": list_favorite_artists()}); return
         match = ARTIST_ALBUMS_RE.match(path)
         if match:
             self.handle_artist_albums(match.group(1), query); return
@@ -3154,6 +3446,9 @@ class Handler(BaseHTTPRequestHandler):
         match = FAVORITE_TRACK_RE.match(path)
         if match:
             self.send_json(200, {"favorited": is_favorite_track(match.group(1))}); return
+        match = FAVORITE_ARTIST_RE.match(path)
+        if match:
+            self.send_json(200, {"favorited": is_favorite_artist(match.group(1))}); return
         self.send_json(404, {"error": "not_found"})
 
     def handle_status(self):
@@ -3426,16 +3721,25 @@ class Handler(BaseHTTPRequestHandler):
         tracks = [t for t in (clean_track(t) for t in raw) if t][:PLAY_ALBUMS_MAX_TRACKS]
         if not tracks:
             self.send_json(400, {"error": "invalid_tracks"}); return
-        start_track(tracks[0], body.get("device_id"))
-        with _queue_lock:
-            q = load_queue()
-            q["manual"] = tracks[1:]   # a new queue: replaces the old manual and auto sections
-            q["auto"] = []
-            q["auto_tried"] = None
-            save_queue(q)
-        refresh_auto((tracks[-1].get("album_id"), tracks[-1]["uri"]))
-        _driver_wake.set()
+        replace_queue_and_play(tracks, body.get("device_id"))
         self.send_json(200, {"ok": True, "tracks": len(tracks), "truncated": len(raw) > len(tracks)})
+
+    def handle_queue_play_artists(self, body):
+        ids = body.get("artist_ids")
+        if (not isinstance(ids, list) or not ids or len(ids) > PLAY_ALBUMS_MAX_ALBUMS
+                or not all(isinstance(i, str) and re.fullmatch(r"[A-Za-z0-9]{10,40}", i) for i in ids)):
+            self.send_json(400, {"error": "invalid_artists"}); return
+        with db() as conn:
+            known = dict(conn.execute("SELECT id, name FROM favorite_artists").fetchall())
+        names = [known[i] for i in dict.fromkeys(ids) if i in known]     # in the order given, each once
+        tracks, artists, empty = build_artist_queue(names, bool(body.get("shuffle")))
+        if not tracks:
+            self.send_json(404, {"error": "no_tracks", "empty": empty}); return
+        tracks = [t for t in (clean_track(t) for t in tracks) if t]
+        if not tracks:
+            self.send_json(404, {"error": "no_tracks", "empty": empty}); return
+        replace_queue_and_play(tracks, body.get("device_id"))
+        self.send_json(200, {"ok": True, "tracks": len(tracks), "artists": artists, "empty": empty})
 
     def handle_queue_clear(self, body):
         with _queue_lock:
@@ -3605,6 +3909,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "genres_must_be_array"}); return
             set_favorite_track_genres(match.group(1), [str(g) for g in genres][:10])
             self.send_json(200, {"ok": True}); return
+        match = FAVORITE_ARTIST_GENRES_RE.match(path)
+        if match:
+            body = self.read_json_body()
+            genres = body.get("genres")
+            if not isinstance(genres, list):
+                self.send_json(400, {"error": "genres_must_be_array"}); return
+            set_favorite_artist_genres(match.group(1), [str(g) for g in genres][:10])
+            self.send_json(200, {"ok": True}); return
+        match = FAVORITE_ARTIST_RE.match(path)
+        if match:
+            body = self.read_json_body()
+            add_favorite_artist(match.group(1), str(body.get("name", "")), body.get("image"))
+            self.send_json(200, {"ok": True}); return
         match = FAVORITE_TRACK_RE.match(path)
         if match:
             body = self.read_json_body()
@@ -3631,6 +3948,10 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             remove_favorite_track(match.group(1))
             self.send_json(200, {"ok": True}); return
+        match = FAVORITE_ARTIST_RE.match(path)
+        if match:
+            remove_favorite_artist(match.group(1))
+            self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
     # -- POST --
@@ -3653,6 +3974,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/spotify-api/queue/play-album": self.handle_queue_play_album,
                   "/spotify-api/queue/play-albums": self.handle_queue_play_albums,
                   "/spotify-api/queue/play-tracks": self.handle_queue_play_tracks,
+                  "/spotify-api/queue/play-artists": self.handle_queue_play_artists,
                   "/spotify-api/queue/clear": self.handle_queue_clear,
                   "/spotify-api/queue/next": self.handle_queue_next}
         if path in routes:
