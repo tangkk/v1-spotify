@@ -57,6 +57,11 @@ Routes:
   PUT    /spotify-api/favorites/<album_id> {"name", "artists", "image", "album_type", "release_date", "tracks"} -- add/update a favorite album
   PUT    /spotify-api/favorites/<album_id>/genres {"genres": [...]} -- hand-tagged genres (Spotify rarely has album-level genre data)
   DELETE /spotify-api/favorites/<album_id> -- remove a favorite album
+  GET    /spotify-api/favorite-tracks            -> {"items": [{id, uri, name, artists, image, album_id, album_name, release_date, duration_ms, genres, added_at}]}
+  GET    /spotify-api/favorite-tracks/<track_id> -> {"favorited": bool}
+  PUT    /spotify-api/favorite-tracks/<track_id> {"uri", "name", "artists", "image", "album_id", "album_name", "release_date", "duration_ms"} -- add/update a favorite track, independent of the album's own favorite status
+  PUT    /spotify-api/favorite-tracks/<track_id>/genres {"genres": [...]}
+  DELETE /spotify-api/favorite-tracks/<track_id>
 """
 import base64
 import json
@@ -97,6 +102,8 @@ ARTIST_DEDUP_RE = re.compile(r"^/spotify-api/artists/([A-Za-z0-9]{10,40})/dedup-
 ALBUM_RE = re.compile(r"^/spotify-api/albums/([A-Za-z0-9]{10,40})$")
 FAVORITE_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})$")
 FAVORITE_GENRES_RE = re.compile(r"^/spotify-api/favorites/([A-Za-z0-9]{10,40})/genres$")
+FAVORITE_TRACK_RE = re.compile(r"^/spotify-api/favorite-tracks/([A-Za-z0-9]{10,40})$")
+FAVORITE_TRACK_GENRES_RE = re.compile(r"^/spotify-api/favorite-tracks/([A-Za-z0-9]{10,40})/genres$")
 ALBUM_TYPE_RANK = {"album": 3, "single": 2, "compilation": 1, "appears_on": 0}
 
 _search_cache = {}
@@ -205,6 +212,19 @@ def db():
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass
+    conn.execute("""CREATE TABLE IF NOT EXISTS favorite_tracks (
+        id TEXT PRIMARY KEY,
+        uri TEXT NOT NULL,
+        name TEXT NOT NULL,
+        artists TEXT NOT NULL,
+        image TEXT,
+        album_id TEXT,
+        album_name TEXT,
+        release_date TEXT,
+        duration_ms INTEGER,
+        genres TEXT,
+        added_at INTEGER NOT NULL
+    )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS catalog_cache (
         cache_key TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -351,6 +371,53 @@ def get_favorite_album_detail(album_id):
         return None
     return {"id": row[0], "name": row[1], "artists": json.loads(row[2]), "image": row[3],
             "album_type": row[4], "release_date": row[5], "tracks": json.loads(row[6])}
+
+
+# Independent from favorite_albums -- a track being favorited has nothing to
+# do with whether its album is. Same shape/conventions throughout (artists as
+# a JSON array of names, genres hand-tagged from the same fixed list, added_at
+# for "recently added" sort) so the frontend can reuse sortFavorites/filtering
+# as-is for both.
+def add_favorite_track(track_id, uri, name, artists, image, album_id, album_name, release_date, duration_ms):
+    with db() as conn:
+        conn.execute("""INSERT INTO favorite_tracks(id, uri, name, artists, image, album_id, album_name, release_date, duration_ms, added_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT(id) DO UPDATE SET
+                             uri=excluded.uri, name=excluded.name, artists=excluded.artists, image=excluded.image,
+                             album_id=excluded.album_id, album_name=excluded.album_name,
+                             release_date=COALESCE(excluded.release_date, favorite_tracks.release_date),
+                             duration_ms=excluded.duration_ms""",
+                     (track_id, uri, name, json.dumps(artists or []), image, album_id, album_name, release_date,
+                      int(duration_ms or 0), int(time.time())))
+        conn.commit()
+
+
+def remove_favorite_track(track_id):
+    with db() as conn:
+        conn.execute("DELETE FROM favorite_tracks WHERE id=?", (track_id,))
+        conn.commit()
+
+
+def list_favorite_tracks():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, uri, name, artists, image, album_id, album_name, release_date, duration_ms, genres, added_at "
+            "FROM favorite_tracks ORDER BY added_at DESC").fetchall()
+    return [{"id": r[0], "uri": r[1], "name": r[2], "artists": json.loads(r[3]), "image": r[4],
+             "album_id": r[5], "album_name": r[6], "release_date": r[7], "duration_ms": r[8],
+             "genres": json.loads(r[9]) if r[9] else [], "added_at": r[10]} for r in rows]
+
+
+def set_favorite_track_genres(track_id, genres):
+    with db() as conn:
+        conn.execute("UPDATE favorite_tracks SET genres=? WHERE id=?", (json.dumps(genres), track_id))
+        conn.commit()
+
+
+def is_favorite_track(track_id):
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM favorite_tracks WHERE id=?", (track_id,)).fetchone()
+    return row is not None
 
 
 # ------------------------------------------------------------- spotify io --
@@ -1255,6 +1322,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
     <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="favoritesButton" title="Favorite albums"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
+    <button class="icon-btn" id="favoriteTracksButton" title="Favorite tracks"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="6.5" cy="15" r="2.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.8 15V4.5L15 3v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
     <button class="icon-btn" id="fullscreenButton" title="Full screen"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M3 7.5V3h4.5M12.5 3H17v4.5M17 12.5V17h-4.5M7.5 17H3v-4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg></button>
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
@@ -1347,6 +1415,7 @@ const ICON_SORT_DESC = '<svg width="18" height="18" viewBox="0 0 20 20"><path d=
 const ICON_TRASH = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M4 5.5h12M8 5.5V3.5h4v2M5.5 5.5l.8 11h7.4l.8-11M8.5 9v4.5M11.5 9v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_MORE = '<svg width="18" height="18" viewBox="0 0 20 20"><circle cx="4.5" cy="10" r="1.5" fill="currentColor"/><circle cx="10" cy="10" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10" r="1.5" fill="currentColor"/></svg>';
 const ICON_CROSS = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const ICON_STAR = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
 
 // Row action buttons (play / add to queue / remove) are the same 38px icon
 // buttons as the header and the transport bar.
@@ -1590,6 +1659,7 @@ async function renderDescriptor(d) {
   if (d.type === 'album') { await loadAlbum(d.id); return; }
   if (d.type === 'dedup') { await loadDedup(d.id, d.name); return; }
   if (d.type === 'favorites') { await loadFavorites(); return; }
+  if (d.type === 'favorite-tracks') { await loadFavoriteTracks(); return; }
   if (d.type === 'queue') { await loadQueueView(); return; }
 }
 
@@ -1649,6 +1719,7 @@ setInterval(pollViewState, 3000);
 // ---- favorites ----
 
 document.getElementById('favoritesButton').onclick = () => goTo({type: 'favorites'});
+document.getElementById('favoriteTracksButton').onclick = () => goTo({type: 'favorite-tracks'});
 document.getElementById('recentlyPlayedButton').onclick = () => goTo({type: 'home'});
 document.getElementById('queueViewButton').onclick = () => goTo({type: 'queue'});
 
@@ -1888,6 +1959,127 @@ function renderFavoritesView() {
         await api('/spotify-api/favorites/' + a.id + '/genres', {method: 'PUT', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({genres: a.genres})});
         renderFavoritesView();
+      };
+      tags.appendChild(chip);
+    }
+    li.appendChild(tags);
+    list.appendChild(li);
+  }
+  view.appendChild(list);
+}
+
+// ---- favorite tracks ----
+// Independent from favorite albums (a track can be favorited without its
+// album being, and vice versa) -- its own store, its own page, but the exact
+// same filter/sort building blocks (COMMON_GENRES/eraOf/FAV_ORDERS/
+// sortFavorites/buildFilterSelect) as the albums page above.
+
+let trackFavoritesState = null;
+let trackFavoritesFilter = {artist: '', genre: '', era: ''};
+let trackFavoritesOrder = 'year';
+let trackFavoritesDirs = Object.assign({}, FAV_DEFAULT_DIRS);
+try {
+  const o = localStorage.getItem('spotify_trackfav_order'); if (FAV_ORDERS.some(x => x[0] === o)) trackFavoritesOrder = o;
+  const d = JSON.parse(localStorage.getItem('spotify_trackfav_dirs') || '{}');
+  for (const k of Object.keys(FAV_DEFAULT_DIRS)) if (d[k] === 'asc' || d[k] === 'desc') trackFavoritesDirs[k] = d[k];
+} catch (e) {}
+
+async function loadFavoriteTracks() {
+  const view = document.getElementById('view');
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const {items} = await api('/spotify-api/favorite-tracks');
+    trackFavoritesState = items;
+    trackFavoritesFilter = {artist: '', genre: '', era: ''};
+    renderTrackFavoritesView();
+  } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
+}
+
+function renderTrackFavoritesView() {
+  const view = document.getElementById('view');
+  view.innerHTML = '';
+  const crumbs = el('div', 'crumbs');
+  const back = el('a', null, '← Back'); back.onclick = () => goBack();
+  crumbs.appendChild(back);
+  view.appendChild(crumbs);
+  view.appendChild(el('h2', null, 'Favorite Tracks'));
+
+  const artists = [...new Set(trackFavoritesState.flatMap(t => t.artists || []))].sort();
+  const eras = [...new Set(trackFavoritesState.map(t => eraOf(t.release_date)).filter(Boolean))].sort();
+  const hasUnknownEra = trackFavoritesState.some(t => !eraOf(t.release_date));
+
+  const filterRow = el('div', 'row');
+  filterRow.style.marginBottom = '14px';
+  filterRow.appendChild(buildFilterSelect(
+    [['', 'All artists'], ...artists.map(a => [a, a])], trackFavoritesFilter.artist,
+    v => { trackFavoritesFilter.artist = v; renderTrackFavoritesView(); }));
+  filterRow.appendChild(buildFilterSelect(
+    [['', 'All genres'], ...COMMON_GENRES.map(g => [g, g]), [UNTAGGED, 'Untagged']], trackFavoritesFilter.genre,
+    v => { trackFavoritesFilter.genre = v; renderTrackFavoritesView(); }));
+  const eraOptions = [['', 'All eras'], ...eras.map(e => [e, e])];
+  if (hasUnknownEra) eraOptions.push([UNKNOWN_ERA, 'Unknown era']);
+  filterRow.appendChild(buildFilterSelect(eraOptions, trackFavoritesFilter.era,
+    v => { trackFavoritesFilter.era = v; renderTrackFavoritesView(); }));
+  filterRow.appendChild(buildFilterSelect(FAV_ORDERS, trackFavoritesOrder, v => {
+    trackFavoritesOrder = v;
+    try { localStorage.setItem('spotify_trackfav_order', v); } catch (e) {}
+    renderTrackFavoritesView();
+  }));
+  const dir = trackFavoritesDirs[trackFavoritesOrder];
+  const dirBtn = iconButton(dir === 'asc' ? ICON_SORT_ASC : ICON_SORT_DESC,
+    dir === 'asc' ? 'Ascending (click for descending)' : 'Descending (click for ascending)');
+  dirBtn.onclick = () => {
+    trackFavoritesDirs[trackFavoritesOrder] = dir === 'asc' ? 'desc' : 'asc';
+    try { localStorage.setItem('spotify_trackfav_dirs', JSON.stringify(trackFavoritesDirs)); } catch (e) {}
+    renderTrackFavoritesView();
+  };
+  filterRow.appendChild(dirBtn);
+  view.appendChild(filterRow);
+
+  const filtered = sortFavorites(trackFavoritesState, trackFavoritesOrder, trackFavoritesDirs[trackFavoritesOrder]).filter(t => {
+    if (trackFavoritesFilter.artist && !(t.artists || []).includes(trackFavoritesFilter.artist)) return false;
+    const genres = t.genres || [];
+    if (trackFavoritesFilter.genre === UNTAGGED && genres.length) return false;
+    if (trackFavoritesFilter.genre && trackFavoritesFilter.genre !== UNTAGGED && !genres.includes(trackFavoritesFilter.genre)) return false;
+    const era = eraOf(t.release_date);
+    if (trackFavoritesFilter.era === UNKNOWN_ERA && era) return false;
+    if (trackFavoritesFilter.era && trackFavoritesFilter.era !== UNKNOWN_ERA && era !== trackFavoritesFilter.era) return false;
+    return true;
+  });
+
+  const list = el('ul', 'list');
+  if (!filtered.length) {
+    list.appendChild(el('li', 'empty', trackFavoritesState.length ? 'No favorite tracks match these filters' : 'No favorite tracks yet'));
+  }
+  for (const t of filtered) {
+    const li = el('li', 'fav-item');
+    li.appendChild(coverImg(t.image));
+    const meta = el('div', 'meta');
+    meta.appendChild(el('div', 'title', t.name));
+    const year = (t.release_date || '').slice(0, 4);
+    meta.appendChild(el('div', 'sub', (t.artists || []).join(', ') + ' · ' + t.album_name + (year ? ' · ' + year : '')));
+    const playFromHere = () => playTrackNow(t);
+    meta.onclick = playFromHere;
+    li.appendChild(meta);
+    li.appendChild(playRowButton(playFromHere));
+    li.appendChild(queueButton(t));
+    const unfavBtn = iconButton(ICON_STAR, 'Remove from favorites', 'icon-btn active');
+    unfavBtn.onclick = async () => {
+      await api('/spotify-api/favorite-tracks/' + t.id, {method: 'DELETE'});
+      trackFavoritesState = trackFavoritesState.filter(x => x.id !== t.id);
+      renderTrackFavoritesView();
+    };
+    li.appendChild(unfavBtn);
+    const tags = el('div', 'genre-tags');
+    for (const g of COMMON_GENRES) {
+      const active = (t.genres || []).includes(g);
+      const chip = el('button', active ? 'chip active' : 'chip', g);
+      chip.onclick = async () => {
+        const genres = t.genres || [];
+        t.genres = active ? genres.filter(x => x !== g) : [...genres, g];
+        await api('/spotify-api/favorite-tracks/' + t.id + '/genres', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({genres: t.genres})});
+        renderTrackFavoritesView();
       };
       tags.appendChild(chip);
     }
@@ -2235,7 +2427,7 @@ async function renderAlbumView(album) {
   playAlbumBtn.onclick = () => playAlbumNow(album.id);
   actions.appendChild(playAlbumBtn);
 
-  const favBtn = iconButton('<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 2.5l2.35 4.76 5.25.76-3.8 3.7.9 5.23L10 14.5l-4.7 2.45.9-5.23-3.8-3.7 5.25-.76z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>', 'Add to favorites', 'icon-btn small');
+  const favBtn = iconButton(ICON_STAR, 'Add to favorites');
   let favorited = false;
   try { const st = await api('/spotify-api/favorites/' + album.id); favorited = !!st.favorited; } catch (e) {}
   const syncFavBtn = () => {
@@ -2264,8 +2456,14 @@ async function renderAlbumView(album) {
   actions.appendChild(refreshBtn);
   view.appendChild(actions);
 
+  // Fetched up front (all local sqlite lookups, no Spotify calls, so cheap
+  // and safe in parallel) so every row's star shows the right state on first
+  // paint instead of flipping a moment after the album renders.
+  const trackFavStates = await Promise.all(album.tracks.map(t =>
+    api('/spotify-api/favorite-tracks/' + t.id).catch(() => ({favorited: false}))));
+
   const list = el('ul', 'list');
-  for (const t of album.tracks) {
+  album.tracks.forEach((t, i) => {
     // Start the real album context at this track (not just a single-track
     // queue), so playback continues through the rest of the album afterward --
     // same continuation behavior as "Play album".
@@ -2280,8 +2478,29 @@ async function renderAlbumView(album) {
     li.appendChild(meta2);
     li.appendChild(playRowButton(playFromHere));
     li.appendChild(queueButton(summary));
+    // A track's own favorite status, independent of whether its album is favorited.
+    const trackFavBtn = iconButton(ICON_STAR, 'Add to favorites');
+    let trackFavorited = !!trackFavStates[i].favorited;
+    const syncTrackFavBtn = () => {
+      trackFavBtn.classList.toggle('active', trackFavorited);
+      trackFavBtn.title = trackFavorited ? 'Remove from favorites' : 'Add to favorites';
+    };
+    syncTrackFavBtn();
+    trackFavBtn.onclick = async () => {
+      trackFavorited = !trackFavorited;
+      syncTrackFavBtn();
+      if (trackFavorited) {
+        await api('/spotify-api/favorite-tracks/' + t.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({uri: summary.uri, name: summary.name, artists: summary.artists, image: summary.image,
+                                 album_id: summary.album_id, album_name: summary.album_name,
+                                 release_date: album.release_date, duration_ms: summary.duration_ms})});
+      } else {
+        await api('/spotify-api/favorite-tracks/' + t.id, {method: 'DELETE'});
+      }
+    };
+    li.appendChild(trackFavBtn);
     list.appendChild(li);
-  }
+  });
   view.appendChild(list);
 }
 
@@ -2787,6 +3006,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, get_view_state()); return
         if path == "/spotify-api/favorites":
             self.send_json(200, {"items": list_favorites()}); return
+        if path == "/spotify-api/favorite-tracks":
+            self.send_json(200, {"items": list_favorite_tracks()}); return
         match = ARTIST_ALBUMS_RE.match(path)
         if match:
             self.handle_artist_albums(match.group(1), query); return
@@ -2799,6 +3020,9 @@ class Handler(BaseHTTPRequestHandler):
         match = FAVORITE_RE.match(path)
         if match:
             self.send_json(200, {"favorited": is_favorite(match.group(1))}); return
+        match = FAVORITE_TRACK_RE.match(path)
+        if match:
+            self.send_json(200, {"favorited": is_favorite_track(match.group(1))}); return
         self.send_json(404, {"error": "not_found"})
 
     def handle_status(self):
@@ -3222,6 +3446,23 @@ class Handler(BaseHTTPRequestHandler):
             add_favorite(match.group(1), body.get("name", ""), body.get("artists"), body.get("image"),
                          body.get("album_type"), body.get("release_date"), body.get("tracks"))
             self.send_json(200, {"ok": True}); return
+        match = FAVORITE_TRACK_GENRES_RE.match(path)
+        if match:
+            body = self.read_json_body()
+            genres = body.get("genres")
+            if not isinstance(genres, list):
+                self.send_json(400, {"error": "genres_must_be_array"}); return
+            set_favorite_track_genres(match.group(1), [str(g) for g in genres][:10])
+            self.send_json(200, {"ok": True}); return
+        match = FAVORITE_TRACK_RE.match(path)
+        if match:
+            body = self.read_json_body()
+            uri = body.get("uri")
+            if not isinstance(uri, str) or not uri.startswith("spotify:track:"):
+                self.send_json(400, {"error": "invalid_uri"}); return
+            add_favorite_track(match.group(1), uri, body.get("name", ""), body.get("artists"), body.get("image"),
+                               body.get("album_id"), body.get("album_name"), body.get("release_date"), body.get("duration_ms"))
+            self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
     # -- DELETE --
@@ -3234,6 +3475,10 @@ class Handler(BaseHTTPRequestHandler):
         match = FAVORITE_RE.match(path)
         if match:
             remove_favorite(match.group(1))
+            self.send_json(200, {"ok": True}); return
+        match = FAVORITE_TRACK_RE.match(path)
+        if match:
+            remove_favorite_track(match.group(1))
             self.send_json(200, {"ok": True}); return
         self.send_json(404, {"error": "not_found"})
 
