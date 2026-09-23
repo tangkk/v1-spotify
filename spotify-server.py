@@ -63,9 +63,9 @@ Routes:
   PUT    /spotify-api/favorite-tracks/<track_id> {"uri", "name", "artists", "image", "album_id", "album_name", "release_date", "duration_ms"} -- add/update a favorite track, independent of the album's own favorite status
   PUT    /spotify-api/favorite-tracks/<track_id>/genres {"genres": [...]}
   DELETE /spotify-api/favorite-tracks/<track_id>
-  GET    /spotify-api/favorite-artists            -> {"items": [{id, name, image, genres, added_at, track_count}]} (track_count = favorite tracks + favorite albums' tracks by that artist name, all local)
-  GET    /spotify-api/favorite-artists/<artist_id> -> {"favorited": bool}
-  PUT    /spotify-api/favorite-artists/<artist_id> {"name", "image"}
+  GET    /spotify-api/favorite-artists            -> {"items": [{id, name, image, genres, added_at, release_date, track_count}]} (release_date = the artist's earliest album; track_count = favorite tracks + favorite albums' tracks by that artist name, all local)
+  GET    /spotify-api/favorite-artists/<artist_id> -> {"favorited": bool, "release_date"}
+  PUT    /spotify-api/favorite-artists/<artist_id> {"name", "image", "release_date"}
   PUT    /spotify-api/favorite-artists/<artist_id>/genres {"genres": [...]}
   DELETE /spotify-api/favorite-artists/<artist_id>
   POST   /spotify-api/queue/play-artists {"artist_ids": [...], "shuffle": bool, "device_id"} -- play those artists' favorited music as one queue (see build_artist_queue)
@@ -242,6 +242,10 @@ def db():
         genres TEXT,
         added_at INTEGER NOT NULL
     )""")
+    try:    # added after the table first shipped: the date of the artist's earliest album, for Year/Era
+        conn.execute("ALTER TABLE favorite_artists ADD COLUMN first_release_date TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""CREATE TABLE IF NOT EXISTS catalog_cache (
         cache_key TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -452,13 +456,17 @@ def is_favorite_track(track_id):
 # purely from local data: the favorite tracks and the favorite albums' cached
 # tracks whose artist *name* matches (those tables store names, not ids) --
 # no Spotify call at all.
-def add_favorite_artist(artist_id, name, image):
+def add_favorite_artist(artist_id, name, image, first_release_date=None):
+    # first_release_date: the release date of the artist's earliest album (the
+    # client computes it from the album list it already has on the artist
+    # page). It is what gives an artist a Year/Era at all.
     with db() as conn:
-        conn.execute("""INSERT INTO favorite_artists(id, name, image, genres, added_at)
-                         VALUES (?, ?, ?, ?, ?)
+        conn.execute("""INSERT INTO favorite_artists(id, name, image, genres, first_release_date, added_at)
+                         VALUES (?, ?, ?, ?, ?, ?)
                          ON CONFLICT(id) DO UPDATE SET name=excluded.name,
-                             image=COALESCE(excluded.image, favorite_artists.image)""",
-                     (artist_id, name, image, json.dumps(DEFAULT_FAVORITE_GENRES), int(time.time())))
+                             image=COALESCE(excluded.image, favorite_artists.image),
+                             first_release_date=COALESCE(excluded.first_release_date, favorite_artists.first_release_date)""",
+                     (artist_id, name, image, json.dumps(DEFAULT_FAVORITE_GENRES), first_release_date, int(time.time())))
         conn.commit()
 
 
@@ -468,10 +476,11 @@ def remove_favorite_artist(artist_id):
         conn.commit()
 
 
-def is_favorite_artist(artist_id):
+def favorite_artist_state(artist_id):
+    """{"favorited": bool, "release_date": earliest-album date or None}."""
     with db() as conn:
-        row = conn.execute("SELECT 1 FROM favorite_artists WHERE id=?", (artist_id,)).fetchone()
-    return row is not None
+        row = conn.execute("SELECT first_release_date FROM favorite_artists WHERE id=?", (artist_id,)).fetchone()
+    return {"favorited": row is not None, "release_date": row[0] if row else None}
 
 
 def set_favorite_artist_genres(artist_id, genres):
@@ -518,10 +527,13 @@ def favorite_track_pools():
 def list_favorite_artists():
     pools = favorite_track_pools()
     with db() as conn:
-        rows = conn.execute("SELECT id, name, image, genres, added_at FROM favorite_artists "
+        rows = conn.execute("SELECT id, name, image, genres, added_at, first_release_date FROM favorite_artists "
                             "ORDER BY added_at DESC").fetchall()
+    # "release_date" here is the artist's earliest album, named the same as on
+    # albums/tracks so sortFavorites/eraOf work on all three lists unchanged.
     return [{"id": r[0], "name": r[1], "image": r[2], "genres": json.loads(r[3]) if r[3] else [],
-             "added_at": r[4], "track_count": len(pools.get(r[1].lower(), []))} for r in rows]
+             "added_at": r[4], "release_date": r[5],
+             "track_count": len(pools.get(r[1].lower(), []))} for r in rows]
 
 
 def build_artist_queue(names, shuffle):
@@ -1841,7 +1853,20 @@ function shuffled(arr) {
 let navStack = [];
 let currentDescriptor = {type: 'home'};
 
+// The header button of the page being shown is highlighted (the same black
+// "active" look as the other toggles). Every navigation -- goTo, goBack,
+// another device's navigation, boot -- goes through renderDescriptor, so this
+// is the one place that keeps it right. Pages with no header button (search,
+// artist, album...) leave none selected.
+const HEADER_BUTTON_FOR_VIEW = {home: 'recentlyPlayedButton', queue: 'queueViewButton', favorites: 'favoritesButton',
+                                'favorite-tracks': 'favoriteTracksButton', 'favorite-artists': 'favoriteArtistsButton'};
+function syncHeaderSelection(d) {
+  const current = HEADER_BUTTON_FOR_VIEW[(d && d.type) || 'home'];
+  for (const id of Object.values(HEADER_BUTTON_FOR_VIEW)) document.getElementById(id).classList.toggle('active', id === current);
+}
+
 async function renderDescriptor(d) {
+  syncHeaderSelection(d);
   if (!d || d.type === 'home') { await loadRecentlyPlayed(); return; }
   if (d.type === 'search') { document.getElementById('searchInput').value = d.query || ''; await runSearch(d.query, d.kind || 'artist'); return; }
   if (d.type === 'artist') { await loadArtist(d.id, d.name); return; }
@@ -2298,14 +2323,15 @@ function renderTrackFavoritesView() {
 }
 
 // ---- favorite artists ----
-// Same building blocks as the album/track favorites pages, minus what makes no
-// sense for an artist: no Artist filter (the row *is* the artist) and no
-// Year/Era (an artist has no release date), so only Genre, and order by
-// Recently added or A-Z.
-const ARTIST_FAV_ORDERS = [['added', 'Order: Recently added'], ['alpha', 'Order: A–Z']];
+// Same building blocks as the album/track favorites pages, minus the Artist
+// filter (the row *is* the artist). An artist's Year/Era is the date of their
+// earliest album, stored when they're favorited (see earliestRelease), so
+// "Year" here means when they started, not a release.
+const ARTIST_FAV_ORDERS = FAV_ORDERS;
 let artistFavoritesState = null;
 let artistFavoritesGenre = '';
-let artistFavoritesOrder = 'added';
+let artistFavoritesEra = '';
+let artistFavoritesOrder = 'year';
 let artistFavoritesDirs = Object.assign({}, FAV_DEFAULT_DIRS);
 try {
   const o = localStorage.getItem('spotify_artistfav_order'); if (ARTIST_FAV_ORDERS.some(x => x[0] === o)) artistFavoritesOrder = o;
@@ -2320,6 +2346,7 @@ async function loadFavoriteArtists() {
     const {items} = await api('/spotify-api/favorite-artists');
     artistFavoritesState = items;
     artistFavoritesGenre = '';
+    artistFavoritesEra = '';
     renderArtistFavoritesView();
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
@@ -2338,6 +2365,11 @@ function renderArtistFavoritesView() {
   filterRow.appendChild(buildFilterSelect(
     [['', 'All genres'], ...COMMON_GENRES.map(g => [g, g]), [UNTAGGED, 'Untagged']], artistFavoritesGenre,
     v => { artistFavoritesGenre = v; renderArtistFavoritesView(); }));
+  const artistEras = [...new Set(artistFavoritesState.map(a => eraOf(a.release_date)).filter(Boolean))].sort();
+  const artistEraOptions = [['', 'All eras'], ...artistEras.map(e => [e, e])];
+  if (artistFavoritesState.some(a => !eraOf(a.release_date))) artistEraOptions.push([UNKNOWN_ERA, 'Unknown era']);
+  filterRow.appendChild(buildFilterSelect(artistEraOptions, artistFavoritesEra,
+    v => { artistFavoritesEra = v; renderArtistFavoritesView(); }));
   filterRow.appendChild(buildFilterSelect(ARTIST_FAV_ORDERS, artistFavoritesOrder, v => {
     artistFavoritesOrder = v;
     try { localStorage.setItem('spotify_artistfav_order', v); } catch (e) {}
@@ -2356,8 +2388,12 @@ function renderArtistFavoritesView() {
 
   const filtered = sortFavorites(artistFavoritesState, artistFavoritesOrder, artistFavoritesDirs[artistFavoritesOrder]).filter(a => {
     const genres = a.genres || [];
-    if (artistFavoritesGenre === UNTAGGED) return !genres.length;
-    return !artistFavoritesGenre || genres.includes(artistFavoritesGenre);
+    if (artistFavoritesGenre === UNTAGGED && genres.length) return false;
+    if (artistFavoritesGenre && artistFavoritesGenre !== UNTAGGED && !genres.includes(artistFavoritesGenre)) return false;
+    const era = eraOf(a.release_date);
+    if (artistFavoritesEra === UNKNOWN_ERA && era) return false;
+    if (artistFavoritesEra && artistFavoritesEra !== UNKNOWN_ERA && era !== artistFavoritesEra) return false;
+    return true;
   });
 
   if (filtered.length) {
@@ -2380,8 +2416,9 @@ function renderArtistFavoritesView() {
     li.appendChild(coverImg(a.image));
     const meta = el('div', 'meta');
     meta.appendChild(el('div', 'title', a.name));
-    meta.appendChild(el('div', 'sub', a.track_count ? a.track_count + ' favorite track' + (a.track_count === 1 ? '' : 's')
-                                                     : 'no favorite tracks yet'));
+    const since = (a.release_date || '').slice(0, 4);
+    meta.appendChild(el('div', 'sub', (since ? 'since ' + since + ' · ' : '') +
+      (a.track_count ? a.track_count + ' favorite track' + (a.track_count === 1 ? '' : 's') : 'no favorite tracks yet')));
     meta.onclick = () => goTo({type: 'artist', id: a.id, name: a.name});
     li.appendChild(meta);
     const unfavBtn = iconButton(ICON_PERSON, 'Remove from favorite artists', 'icon-btn active');
@@ -2641,14 +2678,29 @@ function renderSearchResults() {
   }
 }
 
+// An artist's Year/Era is the date of their earliest album (any release_date
+// that isn't a plausible year, e.g. a bogus 0000/1800s placeholder, is ignored).
+function earliestRelease(albums) {
+  const dates = (albums || []).map(a => a.release_date || '').filter(d => /^\d{4}/.test(d) && parseInt(d.slice(0, 4), 10) >= 1900);
+  return dates.length ? dates.sort()[0] : null;
+}
+
 async function loadArtist(id, name, refresh) {
   const view = document.getElementById('view');
   view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const albums = await api('/spotify-api/artists/' + id + '/albums' + (refresh ? '?refresh=1' : ''));
-    let favorited = false;
-    try { favorited = !!(await api('/spotify-api/favorite-artists/' + id)).favorited; } catch (e) {}
-    renderArtistView({id, name, albums: albums.items, favorited});
+    let favState = {favorited: false};
+    try { favState = await api('/spotify-api/favorite-artists/' + id); } catch (e) {}
+    const firstRelease = earliestRelease(albums.items);
+    const artistImage = (albums.items[0] || {}).image || null;
+    // Artists favorited before Year/Era existed have no date yet: fill it in
+    // from the album list that's already on screen, no extra request to Spotify.
+    if (favState.favorited && !favState.release_date && firstRelease) {
+      api('/spotify-api/favorite-artists/' + id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, image: artistImage, release_date: firstRelease})}).catch(() => {});
+    }
+    renderArtistView({id, name, albums: albums.items, favorited: favState.favorited, firstRelease});
     if (refresh) showToast('Refreshed');
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
@@ -2679,7 +2731,8 @@ function renderArtistView(artist) {
     syncFavArtist();
     if (artistFavorited) {
       await api('/spotify-api/favorite-artists/' + artist.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: artist.name, image: ((artist.albums || [])[0] || {}).image || null})});
+        body: JSON.stringify({name: artist.name, image: ((artist.albums || [])[0] || {}).image || null,
+                               release_date: artist.firstRelease || null})});
     } else {
       await api('/spotify-api/favorite-artists/' + artist.id, {method: 'DELETE'});
     }
@@ -3448,7 +3501,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"favorited": is_favorite_track(match.group(1))}); return
         match = FAVORITE_ARTIST_RE.match(path)
         if match:
-            self.send_json(200, {"favorited": is_favorite_artist(match.group(1))}); return
+            self.send_json(200, favorite_artist_state(match.group(1))); return
         self.send_json(404, {"error": "not_found"})
 
     def handle_status(self):
@@ -3920,7 +3973,9 @@ class Handler(BaseHTTPRequestHandler):
         match = FAVORITE_ARTIST_RE.match(path)
         if match:
             body = self.read_json_body()
-            add_favorite_artist(match.group(1), str(body.get("name", "")), body.get("image"))
+            frd = body.get("release_date")
+            add_favorite_artist(match.group(1), str(body.get("name", "")), body.get("image"),
+                                frd if isinstance(frd, str) and re.match(r"^\d{4}", frd) else None)
             self.send_json(200, {"ok": True}); return
         match = FAVORITE_TRACK_RE.match(path)
         if match:
