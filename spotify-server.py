@@ -1437,7 +1437,7 @@ const ICON_STAR = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 
 // Track favorites use a heart, distinct from the star used for album favorites.
 const ICON_HEART = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 16.3s-6-4.2-6-8.4C4 5.3 5.8 3.5 8 3.5c.9 0 1.7.4 2 1 .3-.6 1.1-1 2-1 2.2 0 4 1.8 4 4.4 0 4.2-6 8.4-6 8.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 // Distinct from the normal play button -- for the separate "shuffle" action.
-const ICON_SHUFFLE = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M2.5 6h3l8 7h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 14h3l8-8h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 4l2.5 2-2.5 2M14.5 12l2.5 2-2.5 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ICON_SHUFFLE = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M2.5 6h3l8 8h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 14h3l8-8h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 4l2.5 2-2.5 2M14.5 12l2.5 2-2.5 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // Row action buttons (play / add to queue / remove) are the same 38px icon
 // buttons as the header and the transport bar.
