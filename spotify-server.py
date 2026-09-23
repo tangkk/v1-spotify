@@ -1253,6 +1253,8 @@ SPOTIFY_PAGE = r"""<!doctype html>
   .icon-btn:hover { background:#f0f0f0; }
   .icon-btn.active { background:#000; color:#fff; }
   .icon-btn.active:hover { background:#222; }
+  .icon-btn:disabled { opacity:.35; cursor:default; }
+  .icon-btn:disabled:hover { background:#fff; }
   input[type=text] { flex:1; min-width:160px; padding:9px 10px; border:1px solid #999; font:inherit; font-size:15px; }
   h2 { font-size:15px; margin:22px 0 10px; }
   ul.list { list-style:none; margin:0; padding:0; }
@@ -2609,65 +2611,71 @@ async function skipNext() {
 }
 document.getElementById('npPrev').onclick = skipPrevious;
 document.getElementById('npNext').onclick = skipNext;
-// want: true = make sure it plays, false = make sure it pauses, omitted = toggle
-// (lock-screen play/pause pass it so a stale button can't flip the wrong way).
+// want: true = make sure it plays, false = make sure it pauses, omitted =
+// toggle (lock-screen play/pause pass it so a stale button can't flip the
+// wrong way). Exactly one action in flight at a time: a click while one is
+// still pending is ignored outright, the button is disabled meanwhile, and
+// the icon is only ever set once -- to whatever actually landed -- never
+// flipped optimistically and never corrected later by an independent timer.
+// That's what "click Play, it's not clickable again until Play has actually
+// settled, only then can you click Pause" means: one clear action per click,
+// nothing running in the background afterward that could race a later one.
+let playPauseBusy = false;
 async function togglePlayPause(want) {
-  await ensureAudioUnlocked();
-  // Fast path: this tab *is* the Spotify device, so the SDK already knows
-  // whether it is playing and can pause/resume it directly -- no V1 or
-  // Spotify Web API round trips (each ~0.3s, three in a row on the slow path
-  // below) before anything happens or the button changes.
-  if (fastPlayEnabled && state.player && state.deviceId) {
-    let st = null;
-    try { st = await state.player.getCurrentState(); } catch (e) {}
-    if (st && await toggleViaSdk(st, want)) return;
-  }
-  const device_id = await ensureDevice();
-  if (!device_id) return;
-  const np = await api('/spotify-api/player/now-playing');
-  if (typeof want === 'boolean' && !!np.playing === want) return;
-  if (np.playing) {
-    await api('/spotify-api/player/pause', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
-  } else if (np.live === false && np.track) {
-    // np.live===false means this is the cached snapshot from before a reload
-    // -- this device_id is brand new and was never given a context to resume,
-    // so a bare "play" has nothing to continue. Explicitly restart the same
-    // track at its saved position instead of silently doing nothing.
-    const body = {device_id, uris: [np.track.uri], position_ms: np.progress_ms || 0};
-    await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  } else {
-    await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
-  }
-  pollNowPlaying();
-}
-// Returns true when handled locally. The button and progress bar switch
-// immediately; if the SDK hasn't actually changed state 2s later, the Web API
-// is asked to do it instead, so a wedged iframe can't leave the tab stuck.
-// The Web API's is_playing lags the SDK by a moment; for 3s after a local
-// toggle pollNowPlaying trusts the toggle so the button doesn't flip back.
-let localPlayIntent = null;
-async function toggleViaSdk(st, want) {
-  const playing = !st.paused;
-  const wantPlay = typeof want === 'boolean' ? want : !playing;
-  if (wantPlay === playing) return true;
-  setPlayButton(wantPlay);
-  if (wantPlay) await lockAudioStartFirst();
-  localPlayIntent = {playing: wantPlay, until: Date.now() + 3000};
-  if (npState) npState = Object.assign({}, npState, {progressMs: st.position, at: Date.now(), playing: wantPlay});
+  if (playPauseBusy) return;
+  playPauseBusy = true;
+  const btn = document.getElementById('npPlay');
+  btn.disabled = true;
   try {
-    if (wantPlay) await state.player.resume(); else await state.player.pause();
-  } catch (e) { pollNowPlaying(); return false; }
-  setTimeout(async () => {
-    let now = null;
-    try { now = await state.player.getCurrentState(); } catch (e) {}
-    if (now && now.paused === !wantPlay) return;
-    try {
-      const body = JSON.stringify({device_id: state.deviceId});
-      await api('/spotify-api/player/' + (wantPlay ? 'play' : 'pause'), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body});
-    } catch (e) {}
-    pollNowPlaying();
-  }, 2000);
-  return true;
+    await ensureAudioUnlocked();
+    let handled = false;
+    // Fast path: this tab *is* the Spotify device, so the SDK already knows
+    // whether it is playing and can pause/resume it directly -- no V1 or
+    // Spotify Web API round trips (each ~0.3s) before anything happens.
+    if (fastPlayEnabled && state.player && state.deviceId) {
+      let st = null;
+      try { st = await state.player.getCurrentState(); } catch (e) {}
+      if (st) {
+        const playing = !st.paused;
+        const wantPlay = typeof want === 'boolean' ? want : !playing;
+        if (wantPlay === playing) {
+          setPlayButton(playing);
+          handled = true;
+        } else {
+          try {
+            if (wantPlay) await lockAudioStartFirst();
+            if (wantPlay) await state.player.resume(); else await state.player.pause();
+            setPlayButton(wantPlay);
+            if (npState) npState = Object.assign({}, npState, {progressMs: st.position, at: Date.now(), playing: wantPlay});
+            handled = true;
+          } catch (e) { /* fall through to the Web API path below */ }
+        }
+      }
+    }
+    if (!handled) {
+      const device_id = await ensureDevice();
+      if (!device_id) return;
+      const np = await api('/spotify-api/player/now-playing');
+      const wantPlay = typeof want === 'boolean' ? want : !np.playing;
+      if (wantPlay !== np.playing) {
+        if (wantPlay && np.live === false && np.track) {
+          // np.live===false means this is the cached snapshot from before a
+          // reload -- this device_id is brand new and was never given a
+          // context to resume, so a bare "play" has nothing to continue.
+          // Explicitly restart the same track at its saved position instead
+          // of silently doing nothing.
+          const body = {device_id, uris: [np.track.uri], position_ms: np.progress_ms || 0};
+          await api('/spotify-api/player/play', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+        } else {
+          await api('/spotify-api/player/' + (wantPlay ? 'play' : 'pause'), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id})});
+        }
+      }
+      await pollNowPlaying();   // reflects whatever actually happened, settled
+    }
+  } finally {
+    playPauseBusy = false;
+    btn.disabled = false;
+  }
 }
 // Play/pause share one button; the glyph shows the action a click will take.
 const ICON_PLAY = '<svg width="18" height="18" viewBox="0 0 20 20"><path d="M6 3.5v13L16.5 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
@@ -2736,7 +2744,6 @@ async function syncNpFavoriteButton(track) {
 async function pollNowPlaying() {
   try {
     const np = await api('/spotify-api/player/now-playing');
-    if (np.track && localPlayIntent && Date.now() < localPlayIntent.until) np.playing = localPlayIntent.playing;
     const bar = document.getElementById('nowplaying');
     if (!np.track) {
       // Only true when nothing has ever played this session (no server-side
