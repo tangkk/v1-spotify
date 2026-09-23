@@ -1778,7 +1778,11 @@ async function loadQueueView() {
   try {
     const q = await api('/spotify-api/queue');
     state.autoplay = q.autoplay;
-    renderQueueView(q);
+    let currentFavorited = false;
+    if (q.current && q.current.id) {
+      try { currentFavorited = !!(await api('/spotify-api/favorite-tracks/' + q.current.id)).favorited; } catch (e) {}
+    }
+    renderQueueView(q, currentFavorited);
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
 
@@ -1807,13 +1811,13 @@ function queueRow(track, tag, buttons) {
 // Manual items come first, then a boundary, then the automatic ones. A track
 // that Spotify has already been handed (the last ~15s of the current song)
 // is locked as "next" and can't be removed any more.
-function renderQueueView(q) {
+function renderQueueView(q, currentFavorited) {
   const view = document.getElementById('view');
   view.innerHTML = '';
   if (q.current) {
     view.appendChild(el('h2', null, 'Now Playing'));
     const nowList = el('ul', 'list');
-    nowList.appendChild(trackRow(q.current, []));
+    nowList.appendChild(trackRow(q.current, [trackFavoriteButton(q.current, currentFavorited)]));
     view.appendChild(nowList);
   }
   const heading = el('div', 'row');
@@ -3319,9 +3323,11 @@ class Handler(BaseHTTPRequestHandler):
         current = None
         if last and last.get("track"):
             t = last["track"]
-            current = {"id": None, "uri": t.get("uri"), "name": t.get("name"), "image": t.get("image"),
+            uri = t.get("uri") or ""
+            current = {"id": uri.split(":")[-1] if uri else None, "uri": uri, "name": t.get("name"), "image": t.get("image"),
                        "artists": t.get("artists", []), "album_id": t.get("album_id"),
-                       "album_name": t.get("album") or "", "duration_ms": t.get("duration_ms", 0)}
+                       "album_name": t.get("album") or "", "release_date": t.get("release_date", ""),
+                       "duration_ms": t.get("duration_ms", 0)}
         self.send_json(200, {"current": current, "next": q["next"], "manual": q["manual"], "auto": q["auto"],
                               "autoplay": get_autoplay()})
 
