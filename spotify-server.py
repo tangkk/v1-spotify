@@ -564,15 +564,30 @@ def favorite_track_pools():
     return pools
 
 
+def backfill_artist_images(ids, timeout=4.0):
+    """Look up the missing artist pictures concurrently and wait for them (up to
+    `timeout` seconds in total) so the list that asked shows them straight away.
+    Each artist is looked up once per process and then cached for good, so this
+    only ever costs anything the first time; slow ones finish in the background."""
+    threads = []
+    for aid in ids:
+        if aid not in _artist_image_tried and cache_get(f"artist_meta:{aid}") is None:
+            _artist_image_tried.add(aid)
+            t = threading.Thread(target=refresh_artist_image, args=(aid,), daemon=True)
+            t.start()
+            threads.append(t)
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+
+
 def list_favorite_artists():
     pools = favorite_track_pools()
     with db() as conn:
+        backfill_artist_images([r[0] for r in conn.execute("SELECT id FROM favorite_artists").fetchall()])
+    with db() as conn:
         rows = conn.execute("SELECT id, name, image, genres, added_at, first_release_date FROM favorite_artists "
                             "ORDER BY added_at DESC").fetchall()
-    for r in rows:      # stand-in album covers -> the artist's own picture, in the background, once
-        if r[0] not in _artist_image_tried and cache_get(f"artist_meta:{r[0]}") is None:
-            _artist_image_tried.add(r[0])
-            threading.Thread(target=refresh_artist_image, args=(r[0],), daemon=True).start()
     # "release_date" here is the artist's earliest album, named the same as on
     # albums/tracks so sortFavorites/eraOf work on all three lists unchanged.
     return [{"id": r[0], "name": r[1], "image": r[2], "genres": json.loads(r[3]) if r[3] else [],
@@ -2737,14 +2752,15 @@ async function loadArtist(id, name, refresh) {
     let favState = {favorited: false};
     try { favState = await api('/spotify-api/favorite-artists/' + id); } catch (e) {}
     const firstRelease = earliestRelease(albums.items);
-    const artistImage = (albums.items[0] || {}).image || null;
+    const artistImage = albums.artist_image || (albums.items[0] || {}).image || null;   // own picture, else the newest album's cover
     // Artists favorited before Year/Era existed have no date yet: fill it in
     // from the album list that's already on screen, no extra request to Spotify.
     if (favState.favorited && !favState.release_date && firstRelease) {
       api('/spotify-api/favorite-artists/' + id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name, image: artistImage, release_date: firstRelease})}).catch(() => {});
     }
-    renderArtistView({id, name, albums: albums.items, favorited: favState.favorited, firstRelease});
+    renderArtistView({id, name, albums: albums.items, favorited: favState.favorited, firstRelease,
+                      image: albums.artist_image || null});
     if (refresh) showToast('Refreshed');
   } catch (e) { view.innerHTML = '<div class="error">' + e.message + '</div>'; }
 }
@@ -2758,6 +2774,8 @@ function renderArtistView(artist) {
   view.appendChild(crumbs);
   const heading = el('div', 'row');
   heading.style.margin = '22px 0 10px';
+  // Follows the covers switch like every other cover (coverImg hides it when off).
+  heading.appendChild(coverImg(artist.image, 'cover lg'));
   const artistTitle = el('h2', null, artist.name);
   artistTitle.style.margin = '0';
   heading.appendChild(artistTitle);
@@ -2775,7 +2793,7 @@ function renderArtistView(artist) {
     syncFavArtist();
     if (artistFavorited) {
       await api('/spotify-api/favorite-artists/' + artist.id, {method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: artist.name, image: ((artist.albums || [])[0] || {}).image || null,
+        body: JSON.stringify({name: artist.name, image: artist.image || ((artist.albums || [])[0] || {}).image || null,
                                release_date: artist.firstRelease || null})});
     } else {
       await api('/spotify-api/favorite-artists/' + artist.id, {method: 'DELETE'});
@@ -3658,7 +3676,11 @@ class Handler(BaseHTTPRequestHandler):
                         "release_date": album.get("release_date", ""), "total_tracks": album.get("total_tracks", 0),
                         "image": images[0]["url"] if images else None, "uri": album["uri"]})
         out.sort(key=lambda a: a["release_date"] or "", reverse=True)
-        self.send_json(200, {"items": out})
+        try:      # the artist's own picture for the page heading; the page works without it
+            artist_image = pick_artist_image(fetch_artist_meta(artist_id)["images"])
+        except Exception:
+            artist_image = None
+        self.send_json(200, {"items": out, "artist_image": artist_image})
 
     def handle_dedup(self, artist_id, query):
         groups = query.get("groups", ["album,single,compilation"])[0]
