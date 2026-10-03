@@ -1418,6 +1418,12 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<script>
+// Applied before the stylesheet paints anything, so there's no flash of the
+// wrong theme on load. Toggled by clicking the logo (header.js, near the end
+// of the page); this is just the "remember and apply early" half.
+try { if (localStorage.getItem('spotify_dark') === '1') document.documentElement.classList.add('dark'); } catch (e) {}
+</script>
 <title>Spotify</title>
 <link rel="icon" href="/spotify-api/icon-v2.svg" type="image/svg+xml" sizes="any">
 <link rel="apple-touch-icon" sizes="180x180" href="/spotify-api/apple-touch-icon-v2.png">
@@ -1426,8 +1432,18 @@ SPOTIFY_PAGE = r"""<!doctype html>
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
          touch-action:manipulation; background:#fff; color:#000; min-height:100vh;
          padding:20px 20px 96px; }
+  /* Dark mode: a literal black/white inversion of the whole (deliberately
+     monochrome) page, toggled by clicking the logo -- not a separate dark
+     palette. invert(1) flips lightness *and* hue; hue-rotate(180deg) undoes
+     just the hue part, so the one non-grayscale color (.error's red) stays
+     red instead of turning cyan. Album/artist photos (".cover") get the same
+     filter a second time, cancelling it, so they show true colors instead of
+     a photo negative -- everything else (backgrounds, borders, icons, the
+     logo itself) inverts along with the page, which is the point. */
+  html.dark { filter: invert(1) hue-rotate(180deg); }
+  html.dark img.cover { filter: invert(1) hue-rotate(180deg); }
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
-  .logo { height:32px; width:32px; display:block; }
+  .logo { height:32px; width:32px; display:block; cursor:pointer; }
   .header-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
   @media (max-width: 420px) { .header-right { gap:6px; } }
   .panel { border:1px solid #000; padding:14px 16px; margin-bottom:20px; }
@@ -1528,7 +1544,7 @@ SPOTIFY_PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo">
+  <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo" id="logoButton" title="Toggle dark mode">
   <div class="header-right">
     <button class="icon-btn" id="recentlyPlayedButton" title="Recently played"><svg width="18" height="18" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <button class="icon-btn" id="queueViewButton" title="Play queue"><svg width="18" height="18" viewBox="0 0 20 20"><line x1="4" y1="6" x2="16" y2="6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="10" x2="16" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><line x1="4" y1="14" x2="12" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
@@ -2529,6 +2545,14 @@ function renderArtistFavoritesView() {
   }
   view.appendChild(list);
 }
+
+// ---- theme ----
+// The class is already applied by the tiny blocking script in <head> (before
+// paint); this just wires up the click and keeps localStorage in sync.
+document.getElementById('logoButton').onclick = () => {
+  const dark = document.documentElement.classList.toggle('dark');
+  try { localStorage.setItem('spotify_dark', dark ? '1' : '0'); } catch (e) {}
+};
 
 // ---- search / browse ----
 
