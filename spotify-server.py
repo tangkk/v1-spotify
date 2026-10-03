@@ -1418,11 +1418,20 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- Tints the iOS/Android browser's own status bar and toolbar (not part of
+     the page DOM, so the dark-mode filter below can't reach it); kept in sync
+     with the theme by the same scripts that toggle "dark". -->
+<meta name="theme-color" content="#ffffff" id="themeColorMeta">
 <script>
 // Applied before the stylesheet paints anything, so there's no flash of the
 // wrong theme on load. Toggled by clicking the logo (header.js, near the end
 // of the page); this is just the "remember and apply early" half.
-try { if (localStorage.getItem('spotify_dark') === '1') document.documentElement.classList.add('dark'); } catch (e) {}
+try {
+  if (localStorage.getItem('spotify_dark') === '1') {
+    document.documentElement.classList.add('dark');
+    document.getElementById('themeColorMeta').setAttribute('content', '#000000');
+  }
+} catch (e) {}
 </script>
 <title>Spotify</title>
 <link rel="icon" href="/spotify-api/icon-v2.svg" type="image/svg+xml" sizes="any">
@@ -2551,6 +2560,7 @@ function renderArtistFavoritesView() {
 // paint); this just wires up the click and keeps localStorage in sync.
 document.getElementById('logoButton').onclick = () => {
   const dark = document.documentElement.classList.toggle('dark');
+  document.getElementById('themeColorMeta').setAttribute('content', dark ? '#000000' : '#ffffff');
   try { localStorage.setItem('spotify_dark', dark ? '1' : '0'); } catch (e) {}
 };
 
