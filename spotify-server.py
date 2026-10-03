@@ -1417,11 +1417,15 @@ SPOTIFY_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <!-- Tints the iOS/Android browser's own status bar and toolbar (not part of
      the page DOM, so the dark-mode filter below can't reach it); kept in sync
      with the theme by the same scripts that toggle "dark". -->
 <meta name="theme-color" content="#ffffff" id="themeColorMeta">
+<!-- Only takes effect when added to the home screen (standalone mode has no
+     Safari chrome for theme-color to tint); harmless no-op in a normal tab. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default" id="appleStatusBarMeta">
 <script>
 // Applied before the stylesheet paints anything, so there's no flash of the
 // wrong theme on load. Toggled by clicking the logo (header.js, near the end
@@ -1430,6 +1434,7 @@ try {
   if (localStorage.getItem('spotify_dark') === '1') {
     document.documentElement.classList.add('dark');
     document.getElementById('themeColorMeta').setAttribute('content', '#000000');
+    document.getElementById('appleStatusBarMeta').setAttribute('content', 'black-translucent');
   }
 } catch (e) {}
 </script>
@@ -1438,9 +1443,11 @@ try {
 <link rel="apple-touch-icon" sizes="180x180" href="/spotify-api/apple-touch-icon-v2.png">
 <style>
   * { box-sizing:border-box; }
+  html, body { background:#fff; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
-         touch-action:manipulation; background:#fff; color:#000; min-height:100vh;
-         padding:20px 20px 96px; }
+         touch-action:manipulation; color:#000; min-height:100vh;
+         padding:max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right))
+                 96px max(20px, env(safe-area-inset-left)); }
   /* Dark mode: a literal black/white inversion of the whole (deliberately
      monochrome) page, toggled by clicking the logo -- not a separate dark
      palette. invert(1) flips lightness *and* hue; hue-rotate(180deg) undoes
@@ -1448,8 +1455,19 @@ try {
      red instead of turning cyan. Album/artist photos (".cover") get the same
      filter a second time, cancelling it, so they show true colors instead of
      a photo negative -- everything else (backgrounds, borders, icons, the
-     logo itself) inverts along with the page, which is the point. */
-  html.dark { filter: invert(1) hue-rotate(180deg); }
+     logo itself) inverts along with the page, which is the point.
+     The filter is on #app/#nowplaying, not html/body: filter on an ancestor
+     would also make #nowplaying's position:fixed relative to *that* box
+     instead of the real viewport (a CSS containing-block rule), breaking the
+     pinned player bar; and it would re-invert any literal background we put
+     on html/body back to the wrong color (tried, broke it, see git history)
+     -- html/body keep a real, un-filtered #fff/#000 so the notch/status-bar
+     strip (viewport-fit=cover, safe-area-inset-* above) and an iOS
+     pull-to-refresh overscroll bounce -- both outside any element's painted
+     box, filled by the browser directly from this property -- show the
+     correct color too, not just the filtered content inside #app. */
+  html.dark, html.dark body { background:#000; }
+  html.dark #app, html.dark #nowplaying { filter: invert(1) hue-rotate(180deg); }
   html.dark img.cover { filter: invert(1) hue-rotate(180deg); }
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
   .logo { height:32px; width:32px; display:block; cursor:pointer; }
@@ -1504,8 +1522,13 @@ try {
   .link:hover { color:#000; text-decoration-color:#000; }
   .crumbs { font-size:13px; color:#666; margin-bottom:6px; }
   .crumbs a { color:#000; text-decoration:none; cursor:pointer; }
+  /* Direct child of <body>, not of #app (see the dark-mode comment above):
+     stays pinned to the real viewport bottom regardless of #app's filter,
+     and its own filter independently inverts it in dark mode. */
   #nowplaying { position:fixed; left:0; right:0; bottom:0; background:#fff; border-top:1px solid #000;
-                padding:8px 16px 10px; display:none; flex-direction:column; gap:6px; }
+                padding:8px max(16px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom))
+                        max(16px, env(safe-area-inset-left));
+                display:none; flex-direction:column; gap:6px; }
   #nowplaying .main-row { display:flex; align-items:center; gap:12px; }
   #nowplaying .track { flex:1; min-width:0; }
   #nowplaying .track .title { font-size:13px; }
@@ -1552,6 +1575,7 @@ try {
 </style>
 </head>
 <body>
+<div id="app">
 <header>
   <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo" id="logoButton" title="Toggle dark mode">
   <div class="header-right">
@@ -1579,6 +1603,7 @@ try {
 </div>
 
 <div id="view"></div>
+</div>
 
 <div id="nowplaying">
   <div class="main-row">
@@ -2561,6 +2586,7 @@ function renderArtistFavoritesView() {
 document.getElementById('logoButton').onclick = () => {
   const dark = document.documentElement.classList.toggle('dark');
   document.getElementById('themeColorMeta').setAttribute('content', dark ? '#000000' : '#ffffff');
+  document.getElementById('appleStatusBarMeta').setAttribute('content', dark ? 'black-translucent' : 'default');
   try { localStorage.setItem('spotify_dark', dark ? '1' : '0'); } catch (e) {}
 };
 
