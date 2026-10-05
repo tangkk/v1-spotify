@@ -4061,7 +4061,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_now_playing(self):
         result = spotify_api("GET", "/me/player")
         item = (result or {}).get("item")
-        if item:
+        # Only V1's own device counts as "now playing" here: when the Spotify
+        # app (or any other client) is the active device, the bar falls back to
+        # V1's last snapshot below -- paused, not live -- exactly as if nothing
+        # were playing, so it never shows or controls the app's playback.
+        # Pressing Play then resumes that V1 track on this page (the slow path
+        # in togglePlayPause restarts it at the saved position on this device),
+        # which takes playback over from the app.
+        if item and is_v1_device(result):
             images = (item.get("album", {}).get("images")) or []
             device = (result or {}).get("device") or {}
             payload = {
@@ -4078,19 +4085,19 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "live": True,
             }
-            if is_v1_device(result):
-                set_last_playback(payload)
-                reconcile_queue(item["uri"], payload["progress_ms"])
-                if payload["playing"]:
-                    note_v1_play(item)
+            set_last_playback(payload)
+            reconcile_queue(item["uri"], payload["progress_ms"])
+            if payload["playing"]:
+                note_v1_play(item)
             payload = dict(payload, autoplay=get_autoplay())
             self.send_json(200, payload)
             return
-        # The Web Playback SDK device is this browser tab; Spotify reports no
-        # active device between "tab just reloaded" and "a device reconnects",
-        # which can be indistinguishable from "genuinely stopped". Fall back to
-        # the last known snapshot (frozen, not live) so the bar and playhead
-        # stay put across a refresh instead of going blank.
+        # Either another client is the active device (see above), or none is:
+        # the Web Playback SDK device is this browser tab, and Spotify reports
+        # no active device between "tab just reloaded" and "a device
+        # reconnects", which can be indistinguishable from "genuinely stopped".
+        # Fall back to V1's last known snapshot (frozen, not live) so the bar
+        # and playhead stay put instead of going blank.
         cached = get_last_playback()
         if cached:
             cached["playing"] = False
