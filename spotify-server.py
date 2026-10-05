@@ -2631,23 +2631,23 @@ document.getElementById('coversButton').onclick = () => {
   applyCoversVisibility();
 };
 
-// Full-screen mode: CSS-only layout (works on iPhone, where the Fullscreen API
-// is unavailable for pages) plus the browser's real full screen where offered.
+// Full-screen mode: CSS-only layout (a .fs class on body), deliberately never
+// the browser's own real Fullscreen API. That was tried (requestFullscreen()
+// on <html>, dropped here) and is the suspected cause of a bug no CSS fix
+// could touch: real OS-level fullscreen hands the notch/status-bar strip to
+// the browser/OS chrome, outside the page's paintable surface entirely, so
+// dark mode (and anything else) can never color it correctly there -- four
+// different CSS approaches to that strip all failed on a real device before
+// landing on this. The exit button, safe-area padding, etc. stay useful
+// regardless (Safari's own chrome still occupies screen space even in this
+// CSS-only mode), so none of that is reverted.
 function setFullscreenMode(on) {
   if (on && document.getElementById('nowplaying').style.display === 'none') { showToast('Nothing playing'); return; }
   document.body.classList.toggle('fs', on);
   document.getElementById('fullscreenButton').classList.toggle('active', on);
   syncNpLogo();
-  try {
-    const de = document.documentElement;
-    if (on && !document.fullscreenElement && de.requestFullscreen) de.requestFullscreen().catch(() => {});
-    else if (!on && document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
-  } catch (e) {}
 }
 document.getElementById('fullscreenButton').onclick = () => setFullscreenMode(!document.body.classList.contains('fs'));
-document.addEventListener('fullscreenchange', () => {
-  if (!document.fullscreenElement && document.body.classList.contains('fs')) setFullscreenMode(false);
-});
 
 // Search is split into three buttons (one Spotify API call each) instead of
 // always querying all three types together, since most searches only care
