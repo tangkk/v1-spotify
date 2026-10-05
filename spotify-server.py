@@ -90,7 +90,9 @@ PORT = int(os.environ.get("SPOTIFY_PORT", "8793"))
 DB_PATH = os.environ.get("SPOTIFY_DB", "/opt/spotify/tokens.db")
 CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "https://spotify.example.com/spotify-api/callback")
+# The public callback URL registered in the Spotify developer dashboard; the
+# systemd unit sets it on the server. The default is only for running locally.
+REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8793/spotify-api/callback")
 SCOPES = ("streaming user-read-email user-read-private "
           "user-read-playback-state user-modify-playback-state user-read-currently-playing "
           "user-read-recently-played")
