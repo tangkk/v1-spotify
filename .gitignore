@@ -1,0 +1,5 @@
+# runtime secrets / data
+*.env
+tokens.db*
+__pycache__/
+*.pyc

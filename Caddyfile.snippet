@@ -1,0 +1,16 @@
+handle /spotify-api/* {
+	forward_auth 127.0.0.1:8800 {
+		uri /auth/check
+	}
+	reverse_proxy 127.0.0.1:8793
+}
+@spotifyPage {
+	path /spotify /spotify/
+}
+handle @spotifyPage {
+	forward_auth 127.0.0.1:8800 {
+		uri /auth/check
+	}
+	rewrite * /spotify
+	reverse_proxy 127.0.0.1:8793
+}
