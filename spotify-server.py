@@ -192,6 +192,48 @@ def clear_last_playback():
         _last_playback = None
 
 
+# Isolation from the user's other Spotify clients (the phone/desktop app):
+# /me/player is account-wide, so without this every queue decision and the
+# history followed whatever the *app* was playing -- the driver even pushed
+# V1's next track into the app's queue and restarted V1's queue on the app's
+# device. Everything V1-owned (queue driver, top-up, "current", history) now
+# only reacts when the active device is this page's own Web Playback SDK
+# device, recognised by the name the page gives it (must match the frontend's
+# `new Spotify.Player({name: ...})`). Every V1 tab/device uses that name.
+V1_DEVICE_NAME = "V1 Spotify Player"
+PLAY_HISTORY_KEEP = 200
+_history_lock = threading.Lock()
+
+
+def is_v1_device(player):
+    return ((player or {}).get("device") or {}).get("name") == V1_DEVICE_NAME
+
+
+def note_v1_play(item):
+    """Record a track as played on V1 (V1's own Recently Played -- the account's
+    /me/player/recently-played also has everything the app played). Called on
+    every poll that sees V1's device playing; a track is logged once when it
+    first shows up, not again while it keeps playing."""
+    summary = track_summary(item)
+    if not summary or not summary.get("uri"):
+        return
+    with _history_lock, db() as conn:
+        row = conn.execute("SELECT uri FROM play_history ORDER BY id DESC LIMIT 1").fetchone()
+        if row and row[0] == summary["uri"]:
+            return
+        conn.execute("INSERT INTO play_history(uri, track, played_at) VALUES (?, ?, ?)",
+                     (summary["uri"], json.dumps(summary), int(time.time())))
+        conn.execute("DELETE FROM play_history WHERE id NOT IN "
+                     "(SELECT id FROM play_history ORDER BY id DESC LIMIT ?)", (PLAY_HISTORY_KEEP,))
+        conn.commit()
+
+
+def list_play_history(limit=50):
+    with db() as conn:
+        rows = conn.execute("SELECT track FROM play_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+
 # ---------------------------------------------------------------- storage --
 
 def db():
@@ -234,6 +276,12 @@ def db():
         duration_ms INTEGER,
         genres TEXT,
         added_at INTEGER NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS play_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uri TEXT NOT NULL,
+        track TEXT NOT NULL,
+        played_at INTEGER NOT NULL
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS favorite_artists (
         id TEXT PRIMARY KEY,
@@ -1002,7 +1050,9 @@ def queue_seeds(q, fallback=None):
         return [fallback]
     item = None
     try:
-        item = (spotify_api("GET", "/me/player") or {}).get("item")
+        player = spotify_api("GET", "/me/player") or {}
+        if is_v1_device(player):        # what the app is playing is none of V1's business
+            item = player.get("item")
     except SpotifyAPIError:
         pass
     if item and (item.get("album") or {}).get("id"):
@@ -1213,9 +1263,17 @@ def queue_driver_tick():
         return 30
     player = spotify_api("GET", "/me/player") or {}
     item = player.get("item")
+    if item and not is_v1_device(player):
+        # Another client (the Spotify app) is the active device: leave its
+        # playback and V1's queue alone -- no top-up from its track, no
+        # hand-off into its queue, no "recovering" V1's queue onto it.
+        _driver_seen = None
+        return 15
     topup_auto(item)
     if not item:
         return 15
+    if player.get("is_playing"):
+        note_v1_play(item)
     progress = player.get("progress_ms", 0)
     reconcile_queue(item["uri"], progress)
     if not player.get("is_playing"):
@@ -3836,9 +3894,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"items": result.get("devices", [])})
 
     def handle_recently_played(self):
-        result = spotify_api("GET", "/me/player/recently-played", params={"limit": SPOTIFY_PAGE_LIMIT})
-        out = [track_summary(entry.get("track")) for entry in result.get("items", [])]
-        self.send_json(200, {"items": [t for t in out if t]})
+        # V1's own history (see note_v1_play), not the account-wide
+        # /me/player/recently-played, which also lists everything the app played.
+        self.send_json(200, {"items": list_play_history()})
 
     def handle_queue(self):
         q = load_queue()
@@ -4020,8 +4078,11 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "live": True,
             }
-            set_last_playback(payload)
-            reconcile_queue(item["uri"], payload["progress_ms"])
+            if is_v1_device(result):
+                set_last_playback(payload)
+                reconcile_queue(item["uri"], payload["progress_ms"])
+                if payload["playing"]:
+                    note_v1_play(item)
             payload = dict(payload, autoplay=get_autoplay())
             self.send_json(200, payload)
             return
