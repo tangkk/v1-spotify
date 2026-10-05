@@ -171,25 +171,67 @@ def get_view_state():
 # track and playhead instead of the bar just going blank; handle_now_playing
 # forces playing=False on a cached fallback since we genuinely don't know
 # whether it's still advancing.
+# Persisted in app_settings['last_playback'] so a restart/deploy doesn't lose
+# it (it's what the bar shows while the Spotify app is the active device, and
+# what Play resumes). Polls arrive every few seconds, so the row is only
+# rewritten when the track or play/pause state changes, or every
+# LAST_PLAYBACK_SAVE_EVERY seconds for the playhead -- a pause is a state
+# change, so the resume position after pausing is exact.
+LAST_PLAYBACK_SAVE_EVERY = 15
 _last_playback_lock = threading.Lock()
 _last_playback = None
+_last_playback_loaded = False
+_last_playback_saved = (None, 0.0)   # (track uri + playing, time.time()) of the last write
+
+
+def _load_last_playback():
+    global _last_playback, _last_playback_loaded
+    if _last_playback_loaded:
+        return
+    _last_playback_loaded = True
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT value FROM app_settings WHERE key='last_playback'").fetchone()
+        if row and _last_playback is None:
+            _last_playback = json.loads(row[0])
+    except Exception as exc:
+        print(f"last playback not loaded: {exc}", flush=True)
 
 
 def set_last_playback(payload):
-    global _last_playback
+    global _last_playback, _last_playback_loaded, _last_playback_saved
     with _last_playback_lock:
         _last_playback = payload
+        _last_playback_loaded = True
+        key = ((payload.get("track") or {}).get("uri"), bool(payload.get("playing")))
+        now = time.time()
+        if key == _last_playback_saved[0] and now - _last_playback_saved[1] < LAST_PLAYBACK_SAVE_EVERY:
+            return
+        try:
+            with db() as conn:
+                conn.execute("""INSERT INTO app_settings(key, value) VALUES ('last_playback', ?)
+                                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (json.dumps(payload),))
+                conn.commit()
+            _last_playback_saved = (key, now)
+        except Exception as exc:
+            print(f"last playback not saved: {exc}", flush=True)
 
 
 def get_last_playback():
     with _last_playback_lock:
+        _load_last_playback()
         return dict(_last_playback) if _last_playback else None
 
 
 def clear_last_playback():
-    global _last_playback
+    global _last_playback, _last_playback_loaded, _last_playback_saved
     with _last_playback_lock:
         _last_playback = None
+        _last_playback_loaded = True
+        _last_playback_saved = (None, 0.0)
+        with db() as conn:
+            conn.execute("DELETE FROM app_settings WHERE key='last_playback'")
+            conn.commit()
 
 
 # Isolation from the user's other Spotify clients (the phone/desktop app):
