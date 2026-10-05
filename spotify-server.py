@@ -1552,8 +1552,17 @@ try {
   body.fs header { position:fixed; top:max(12px, env(safe-area-inset-top)); right:max(12px, env(safe-area-inset-right)); z-index:20; margin:0; }
   body.fs header .logo, body.fs .header-right > :not(#fullscreenButton),
   body.fs #connectPanel, body.fs #searchPanel, body.fs #view { display:none !important; }
-  body.fs #nowplaying { top:0; border-top:none;
-                        padding:max(56px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right))
+  /* top is the safe-area inset itself, not 0 -- #nowplaying's own background is
+     filtered (invert) for dark mode, and whether a filtered position:fixed
+     element's paint reliably extends into the actual notch cutout is exactly
+     the kind of WebKit edge case this environment can't test (headless
+     Chrome's env(safe-area-inset-*) is always 0, so that interaction has
+     never actually been exercised). Leaving that strip uncovered by
+     #nowplaying falls back to html/body's own real, unfiltered background for
+     it instead -- the one mechanism already confirmed working on a real
+     device for the non-fullscreen case. */
+  body.fs #nowplaying { top:env(safe-area-inset-top); border-top:none;
+                        padding:56px max(20px, env(safe-area-inset-right))
                                 max(32px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
                         gap:clamp(12px, 3vh, 28px);
                         align-items:center; justify-content:center; z-index:10; overflow:hidden; }
