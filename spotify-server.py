@@ -1566,6 +1566,14 @@ try {
                                 max(32px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
                         gap:clamp(12px, 3vh, 28px);
                         align-items:center; justify-content:center; z-index:10; overflow:hidden; }
+  /* No filter here at all -- a literal color, toggled the plain way, not
+     inverted. z-index above #nowplaying (10) and header (20) so it's the top
+     layer specifically in that strip; everywhere else #nowplaying/header
+     still show through normally since this is only as tall as the inset. */
+  #notchBackdrop { display:none; }
+  body.fs #notchBackdrop { display:block; position:fixed; top:0; left:0; right:0;
+                           height:env(safe-area-inset-top); background:#fff; z-index:30; }
+  html.dark body.fs #notchBackdrop { background:#000; }
   body.fs #nowplaying .main-row { display:contents; }
   body.fs #npCover, body.fs #npLogo { order:1; width:min(72vw, 44vh); height:min(72vw, 44vh); object-fit:cover; }
   body.fs #npLogo { object-fit:contain; }
@@ -1599,6 +1607,17 @@ try {
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
 </header>
+
+<!-- Only shown in fullscreen (see the CSS): an ordinary div, deliberately
+     outside any filtered ancestor and with a literal (not inverted) color of
+     its own, covering exactly the notch/status-bar strip. Exists because
+     relying on html/body's own background to show through that strip -- the
+     mechanism confirmed working for the non-fullscreen case -- did not carry
+     over to fullscreen (overflow:hidden there; whatever iOS does to extend a
+     page's background under the notch may specifically need the page to be
+     a real, scrollable/bounceable one, which a locked-down fullscreen view
+     isn't). This sidesteps that entirely by just painting over the strip. -->
+<div id="notchBackdrop"></div>
 
 <div id="app">
 <div id="connectPanel" class="panel" style="display:none"></div>
