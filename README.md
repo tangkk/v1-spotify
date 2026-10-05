@@ -2,7 +2,98 @@
 
 V1 上的 Spotify 网页播放控制服务（`https://spotify.example.com/spotify`）：单文件 Python 服务（标准库 `ThreadingHTTPServer`，前端页面内嵌在 `SPOTIFY_PAGE` 里），浏览器标签页通过 Web Playback SDK 注册成一台 Spotify Connect 设备，V1 负责 OAuth、Web API 代理、自己的播放队列和收藏。
 
-从 [`V1-web-services-deployment`](../V1-web-services-deployment) 拆出来（`git filter-repo`，保留了这三个文件的完整提交历史）。
+从作者的私有部署仓库拆出来（`git filter-repo`，保留了这几个文件的完整提交历史）。
+
+## 部署到你自己的服务器
+
+### ⚠️ 先看这个：服务本身没有登录
+
+`spotify-server.py` **不做任何鉴权**。谁能访问到它，谁就能控制你的 Spotify 播放、改你的队列和收藏；`/spotify-api/player-token` 还会直接返回你账号的 access token。所以：
+
+- 服务只监听 `127.0.0.1`（默认值，别改成 `0.0.0.0`），对外**只能**经过一个带鉴权的反向代理。下面用 Caddy 的 `basic_auth` 举例；作者自己用的是 `forward_auth` 接另一个登录服务，见 `Caddyfile.snippet`。
+- 这是单用户设计：一个实例绑定一个 Spotify 账号，所有能通过鉴权的人共用这个账号。
+
+### 你需要
+
+- 一台 Linux 服务器（示例用 systemd），**Python 3.9+**。只用标准库，不用 `pip install`。
+- 一个指向这台服务器的域名，以及 HTTPS（Spotify 的回调地址除了 `127.0.0.1`，都必须是 https；Caddy 会自动申请证书）。
+- **Spotify Premium** 账号（免费账号的播放控制接口返回 403，Web Playback SDK 也用不了）。
+
+### 1. 在 Spotify 开发者后台建 App
+
+1. 打开 <https://developer.spotify.com/dashboard> → Create app。
+2. **Redirect URI** 填 `https://你的域名/spotify-api/callback`，必须和下面的 `SPOTIFY_REDIRECT_URI` 一字不差。
+3. **APIs used** 勾上 *Web API* 和 *Web Playback SDK*。
+4. 新建的 App 处于 Development Mode，只有加进 **User Management** 的账号能授权，所以要把你自己的 Spotify 账号邮箱加进去。Development Mode 的配额限制见下面"说明"里的 *Spotify 平台限制*。
+5. 记下 Client ID 和 Client Secret。
+
+### 2. 装服务
+
+```bash
+# 在服务器上（root），仓库已 clone 到当前目录
+mkdir -p /opt/spotify
+cp spotify-server.py /opt/spotify/server.py
+cp spotify-server.env.example /opt/spotify/spotify.env
+chmod 600 /opt/spotify/spotify.env
+$EDITOR /opt/spotify/spotify.env                      # 填 SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET
+
+cp spotify-server.service /etc/systemd/system/spotify-server.service
+$EDITOR /etc/systemd/system/spotify-server.service    # 把 SPOTIFY_REDIRECT_URI 改成你的域名
+systemctl daemon-reload
+systemctl enable --now spotify-server
+curl -s http://127.0.0.1:8793/health                  # {"ok": true}
+```
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | 空 | 必填。放在 `spotify.env` 里，不要提交到任何仓库 |
+| `SPOTIFY_REDIRECT_URI` | `http://127.0.0.1:8793/spotify-api/callback` | 公网部署必改，要和开发者后台填的一致 |
+| `SPOTIFY_HOST` / `SPOTIFY_PORT` | `127.0.0.1` / `8793` | 监听地址 |
+| `SPOTIFY_DB` | `/opt/spotify/tokens.db` | sqlite：refresh token、队列、收藏、播放记录、目录缓存。备份它就备份了全部数据 |
+
+如果 `python3` 不在 `/usr/bin/python3`，改 service 里的 `ExecStart`。
+
+### 3. 反向代理（Caddy 示例）
+
+页面路径固定是 `/spotify`，接口固定是 `/spotify-api/*`，两条路由都必须放在鉴权后面：
+
+```caddy
+spotify.example.com {
+	basic_auth {
+		# 生成哈希：caddy hash-password --plaintext '你的密码'
+		me $2a$14$REPLACE_WITH_HASH
+	}
+	handle /spotify-api/* {
+		reverse_proxy 127.0.0.1:8793
+	}
+	handle /spotify* {
+		rewrite * /spotify
+		reverse_proxy 127.0.0.1:8793
+	}
+	redir / /spotify
+}
+```
+
+`systemctl reload caddy`，然后打开 `https://你的域名/spotify` → 输入 basic auth 密码 → 点 **Connect Spotify** 授权一次。之后在网页上点播放，这个浏览器标签页就是一台叫 "V1 Spotify Player" 的 Spotify Connect 设备。
+
+用 nginx 等其它代理也一样：把 `/spotify` 和 `/spotify-api/` 转到 `127.0.0.1:8793`，前面加鉴权，保留 HTTPS。
+
+### 4. 更新
+
+```bash
+cp spotify-server.py /opt/spotify/server.py
+python3 -m py_compile /opt/spotify/server.py && systemctl restart spotify-server
+```
+
+数据库的表在启动时自动创建或补齐，升级不用手动迁移。
+
+### 本地试用
+
+```bash
+SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... SPOTIFY_DB=./tokens.db python3 spotify-server.py
+```
+
+在开发者后台的 Redirect URI 里加上 `http://127.0.0.1:8793/spotify-api/callback`，然后打开 <http://127.0.0.1:8793/spotify>（只监听本机，所以本地试用不需要鉴权）。
 
 ## 文件
 
@@ -15,26 +106,7 @@ V1 上的 Spotify 网页播放控制服务（`https://spotify.example.com/spotif
 
 数据（OAuth 令牌、队列、收藏、目录缓存）在 V1 的 sqlite `/opt/spotify/tokens.db`，不在仓库里。
 
-## 部署（独立于原仓库时）
-
-```bash
-scp spotify-server.py root@YOUR_SERVER:/opt/spotify/server.py
-scp spotify-server.service root@YOUR_SERVER:/etc/systemd/system/spotify-server.service
-ssh root@YOUR_SERVER 'python3 -m py_compile /opt/spotify/server.py && systemctl daemon-reload && systemctl restart spotify-server && systemctl is-active spotify-server'
-```
-
-注意：**目前 V1 线上仍由 `V1-web-services-deployment` 的 `deploy.sh` 部署**（它会把那边仓库里的 `spotify-server.py` 装到 `/opt/spotify/server.py`）。两边同时改会互相覆盖——要以这个仓库为准，需要先把原仓库里的 Spotify 文件和 `deploy.sh` 里对应的几行去掉。
-
-## 本地运行
-
-```bash
-SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... \
-SPOTIFY_DB=./tokens.db SPOTIFY_PORT=8793 \
-SPOTIFY_REDIRECT_URI=http://127.0.0.1:8793/spotify-api/callback \
-python3 spotify-server.py
-```
-
-（Spotify 开发者后台的 Redirect URI 需要加上对应地址。）
+作者自己的 V1 目前由私有部署仓库的部署脚本安装同一个 `spotify-server.py`，这个公开仓库与它保持同步。
 
 ## 说明（原 README 的 Spotify 章节）
 
