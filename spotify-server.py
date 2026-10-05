@@ -1443,7 +1443,7 @@ try {
 <link rel="apple-touch-icon" sizes="180x180" href="/spotify-api/apple-touch-icon-v2.png">
 <style>
   * { box-sizing:border-box; }
-  html, body { background:#fff; }
+  html, body { background:#fff; margin:0; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
          touch-action:manipulation; color:#000; min-height:100vh;
          padding:max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right))
@@ -1467,7 +1467,7 @@ try {
      box, filled by the browser directly from this property -- show the
      correct color too, not just the filtered content inside #app. */
   html.dark, html.dark body { background:#000; }
-  html.dark #app, html.dark #nowplaying { filter: invert(1) hue-rotate(180deg); }
+  html.dark header, html.dark #app, html.dark #nowplaying { filter: invert(1) hue-rotate(180deg); }
   html.dark img.cover { filter: invert(1) hue-rotate(180deg); }
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
   .logo { height:32px; width:32px; display:block; cursor:pointer; }
@@ -1549,10 +1549,13 @@ try {
      own rows are flattened (display:contents) so its parts can be re-ordered
      into one column: cover/logo, title, progress, controls, volume. */
   body.fs { overflow:hidden; padding:0; }
-  body.fs header { position:fixed; top:12px; right:12px; z-index:20; margin:0; }
+  body.fs header { position:fixed; top:max(12px, env(safe-area-inset-top)); right:max(12px, env(safe-area-inset-right)); z-index:20; margin:0; }
   body.fs header .logo, body.fs .header-right > :not(#fullscreenButton),
   body.fs #connectPanel, body.fs #searchPanel, body.fs #view { display:none !important; }
-  body.fs #nowplaying { top:0; border-top:none; padding:56px 20px 32px; gap:clamp(12px, 3vh, 28px);
+  body.fs #nowplaying { top:0; border-top:none;
+                        padding:max(56px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right))
+                                max(32px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+                        gap:clamp(12px, 3vh, 28px);
                         align-items:center; justify-content:center; z-index:10; overflow:hidden; }
   body.fs #nowplaying .main-row { display:contents; }
   body.fs #npCover, body.fs #npLogo { order:1; width:min(72vw, 44vh); height:min(72vw, 44vh); object-fit:cover; }
@@ -1575,7 +1578,6 @@ try {
 </style>
 </head>
 <body>
-<div id="app">
 <header>
   <img src="/spotify-api/icon-v2.svg" alt="Spotify" class="logo" id="logoButton" title="Toggle dark mode">
   <div class="header-right">
@@ -1589,6 +1591,7 @@ try {
   </div>
 </header>
 
+<div id="app">
 <div id="connectPanel" class="panel" style="display:none"></div>
 
 <div id="searchPanel" class="panel" style="display:none">
