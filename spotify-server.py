@@ -1467,8 +1467,21 @@ try {
      box, filled by the browser directly from this property -- show the
      correct color too, not just the filtered content inside #app. */
   html.dark, html.dark body { background:#000; }
-  html.dark header, html.dark #app, html.dark #nowplaying { filter: invert(1) hue-rotate(180deg); }
+  html.dark header, html.dark #app { filter: invert(1) hue-rotate(180deg); }
   html.dark img.cover { filter: invert(1) hue-rotate(180deg); }
+  /* #nowplaying itself is NOT filtered: its background is a real #000, and
+     only its contents are inverted. iOS 26 Safari ignores theme-color and
+     tints the status bar / bottom toolbar from the CSS background-color of a
+     position:fixed element touching that edge -- the property value, not
+     the filtered pixels. A filtered #nowplaying has a literal #fff
+     background, so in fullscreen (where it covers the top edge) the notch
+     strip came out white, and in normal mode the bottom toolbar could too.
+     (.main-row is display:contents in fullscreen, so its children are
+     filtered rather than it; the cover is left alone -- it was only
+     inverted before to cancel the parent's filter, which is gone.) */
+  html.dark #nowplaying { background:#000; border-top-color:#fff; }
+  html.dark #nowplaying .progress-row, html.dark #nowplaying .main-row > * { filter: invert(1) hue-rotate(180deg); }
+  html.dark #nowplaying #npCover { filter:none; }
   header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:12px; }
   .logo { height:32px; width:32px; display:block; cursor:pointer; }
   .header-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
@@ -1566,14 +1579,6 @@ try {
                                 max(32px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
                         gap:clamp(12px, 3vh, 28px);
                         align-items:center; justify-content:center; z-index:10; overflow:hidden; }
-  /* No filter here at all -- a literal color, toggled the plain way, not
-     inverted. z-index above #nowplaying (10) and header (20) so it's the top
-     layer specifically in that strip; everywhere else #nowplaying/header
-     still show through normally since this is only as tall as the inset. */
-  #notchBackdrop { display:none; }
-  body.fs #notchBackdrop { display:block; position:fixed; top:0; left:0; right:0;
-                           height:env(safe-area-inset-top); background:#fff; z-index:30; }
-  html.dark body.fs #notchBackdrop { background:#000; }
   body.fs #nowplaying .main-row { display:contents; }
   body.fs #npCover, body.fs #npLogo { order:1; width:min(72vw, 44vh); height:min(72vw, 44vh); object-fit:cover; }
   body.fs #npLogo { object-fit:contain; }
@@ -1607,17 +1612,6 @@ try {
     <button class="icon-btn" id="connectionButton" title="Connect Spotify"><svg width="18" height="18" viewBox="0 0 20 20"><path d="M10 3v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/><path d="M5.5 6.5a6 6 0 1 0 9 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg></button>
   </div>
 </header>
-
-<!-- Only shown in fullscreen (see the CSS): an ordinary div, deliberately
-     outside any filtered ancestor and with a literal (not inverted) color of
-     its own, covering exactly the notch/status-bar strip. Exists because
-     relying on html/body's own background to show through that strip -- the
-     mechanism confirmed working for the non-fullscreen case -- did not carry
-     over to fullscreen (overflow:hidden there; whatever iOS does to extend a
-     page's background under the notch may specifically need the page to be
-     a real, scrollable/bounceable one, which a locked-down fullscreen view
-     isn't). This sidesteps that entirely by just painting over the strip. -->
-<div id="notchBackdrop"></div>
 
 <div id="app">
 <div id="connectPanel" class="panel" style="display:none"></div>
@@ -2631,23 +2625,23 @@ document.getElementById('coversButton').onclick = () => {
   applyCoversVisibility();
 };
 
-// Full-screen mode: CSS-only layout (a .fs class on body), deliberately never
-// the browser's own real Fullscreen API. That was tried (requestFullscreen()
-// on <html>, dropped here) and is the suspected cause of a bug no CSS fix
-// could touch: real OS-level fullscreen hands the notch/status-bar strip to
-// the browser/OS chrome, outside the page's paintable surface entirely, so
-// dark mode (and anything else) can never color it correctly there -- four
-// different CSS approaches to that strip all failed on a real device before
-// landing on this. The exit button, safe-area padding, etc. stay useful
-// regardless (Safari's own chrome still occupies screen space even in this
-// CSS-only mode), so none of that is reverted.
+// Full-screen mode: CSS-only layout (works on iPhone, where the Fullscreen API
+// is unavailable for pages) plus the browser's real full screen where offered.
 function setFullscreenMode(on) {
   if (on && document.getElementById('nowplaying').style.display === 'none') { showToast('Nothing playing'); return; }
   document.body.classList.toggle('fs', on);
   document.getElementById('fullscreenButton').classList.toggle('active', on);
   syncNpLogo();
+  try {
+    const de = document.documentElement;
+    if (on && !document.fullscreenElement && de.requestFullscreen) de.requestFullscreen().catch(() => {});
+    else if (!on && document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  } catch (e) {}
 }
 document.getElementById('fullscreenButton').onclick = () => setFullscreenMode(!document.body.classList.contains('fs'));
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && document.body.classList.contains('fs')) setFullscreenMode(false);
+});
 
 // Search is split into three buttons (one Spotify API call each) instead of
 // always querying all three types together, since most searches only care
