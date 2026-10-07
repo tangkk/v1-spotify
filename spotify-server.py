@@ -1890,6 +1890,7 @@ function initSDK() {
     sdkPlayerWaiters = [];
     player.addListener('ready', ({device_id}) => {
       state.deviceId = device_id;
+      deviceVerifiedAt = Date.now();
       deviceReadyWaiters.forEach(fn => fn(device_id));
       deviceReadyWaiters = [];
     });
@@ -1898,6 +1899,7 @@ function initSDK() {
     // background where the 5s setInterval is throttled: keep the lock screen current.
     player.addListener('player_state_changed', st => {
       const cur = st && st.track_window && st.track_window.current_track;
+      deviceVerifiedAt = Date.now();   // the SDK connection is evidently alive
       sdkPos = cur ? {uri: cur.uri, position: st.position, duration: st.duration, paused: st.paused, at: Date.now()} : null;
       if (cur) mediaTrackUri = cur.uri;
       sdkTrackUri = cur ? cur.uri : null;
@@ -1951,8 +1953,49 @@ async function refreshDevices() {
   try {
     const {items} = await api('/spotify-api/devices');
     state.devices = items;
-  } catch (e) {}
+    return true;
+  } catch (e) { return false; }
 }
+
+// state.deviceId can outlive the device itself: after the page sits in the
+// background for a while (an iPhone tab overnight), the SDK's connection and
+// its 1h token both lapse, Spotify drops the device, and no 'not_ready' ever
+// fires -- so every Play went to a dead device_id and Spotify answered 404
+// "Device not found", with nothing visible happening. Before trusting the id,
+// confirm Spotify still lists it (skipped if the SDK showed signs of life in
+// the last minute); if it's gone, disconnect + connect the SDK, which fetches
+// a fresh token via getOAuthToken and comes back with a 'ready'.
+let deviceVerifiedAt = 0;
+let deviceVerifying = null;
+function verifyOwnDevice() {
+  if (!state.deviceId || !state.player) return Promise.resolve(state.deviceId);
+  if (Date.now() - deviceVerifiedAt < 60000) return Promise.resolve(state.deviceId);
+  if (deviceVerifying) return deviceVerifying;
+  deviceVerifying = (async () => {
+    const ok = await refreshDevices();
+    if (!ok || state.devices.some(d => d.id === state.deviceId)) {   // can't tell, or alive: use it
+      if (ok) deviceVerifiedAt = Date.now();
+      return state.deviceId;
+    }
+    showToast('Reconnecting to Spotify…');
+    state.deviceId = null;
+    try { state.player.disconnect(); } catch (e) {}
+    sdkConnectTriggered = true;
+    state.player.connect();
+    const id = await waitForDeviceReady(15000);
+    if (id) deviceVerifiedAt = Date.now();
+    return id;
+  })().finally(() => { deviceVerifying = null; });
+  return deviceVerifying;
+}
+
+// Coming back to the tab after a while: check (and if needed reconnect) right
+// away, so the first tap on Play already has a live device.
+let pageHiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { pageHiddenAt = Date.now(); return; }
+  if (pageHiddenAt && Date.now() - pageHiddenAt > 60000) verifyOwnDevice();
+});
 
 // This browser's own SDK device is always the preferred playback target --
 // that's the whole point of "whichever device you clicked Play on is the one
@@ -1977,11 +2020,15 @@ async function refreshDevices() {
 // Both are given a further chance below before concluding there's truly
 // nothing to play through.
 async function ensureDevice() {
-  if (state.deviceId) return state.deviceId;
-  if (!sdkConnectTriggered) await ensureAudioUnlocked();   // the script may have only just finished loading
-  if (sdkConnectTriggered) {
-    const id = await waitForDeviceReady(15000);
+  if (state.deviceId) {
+    const id = await verifyOwnDevice();
     if (id) return id;
+  } else {
+    if (!sdkConnectTriggered) await ensureAudioUnlocked();   // the script may have only just finished loading
+    if (sdkConnectTriggered) {
+      const id = await waitForDeviceReady(15000);
+      if (id) return id;
+    }
   }
   showToast('Connecting to Spotify…');
   for (let attempt = 0; attempt < 4; attempt++) {
