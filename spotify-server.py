@@ -3864,12 +3864,25 @@ class Handler(BaseHTTPRequestHandler):
         # comma-separated "type") instead of three -- same cost as a single
         # regular search. "Most relevant" isn't something Spotify ranks across
         # types, so this picks whichever type's top result is an exact name
-        # match; with none, it falls back to artist (today's plain-Enter behavior).
+        # match; next, a track/album whose title *and* one of its artists both
+        # appear in the query ("along came betty, pat martino"); with neither,
+        # it falls back to artist (today's plain-Enter behavior).
         result = cached_search("artist,album,track", q, SPOTIFY_PAGE_LIMIT)
         norm = lambda s: re.sub(r"\s+", " ", (s or "").strip()).casefold()
         qn = norm(q)
-        kind = next((k for k in ("artist", "track", "album")
-                     if norm(((result.get(k + "s") or {}).get("items") or [{}])[0].get("name")) == qn), "artist")
+        top = lambda k: ((result.get(k + "s") or {}).get("items") or [{}])[0]
+        # Punctuation-blind, whole-word containment; the title loses suffixes
+        # like " - Remastered 2004" / "(Live)" so they don't block a match.
+        words = lambda s: " " + " ".join(re.findall(r"\w+", (s or "").casefold())) + " "
+        qw = words(q)
+        def names_title_and_artist(item):
+            title = words(re.split(r" - |\(|\[", item.get("name") or "")[0])
+            return (title.strip() != "" and title in qw and
+                    any(words(a.get("name")).strip() and words(a.get("name")) in qw
+                        for a in item.get("artists") or []))
+        kind = (next((k for k in ("artist", "track", "album") if norm(top(k).get("name")) == qn), None)
+                or next((k for k in ("track", "album") if names_title_and_artist(top(k))), None)
+                or "artist")
         block = result.get(kind + "s") or {}
         items = block.get("items", [])
         total = block.get("total", len(items))
