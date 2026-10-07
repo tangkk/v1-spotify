@@ -2175,9 +2175,9 @@ document.getElementById('favoriteArtistsButton').onclick = () => goTo({type: 'fa
 document.getElementById('recentlyPlayedButton').onclick = () => goTo({type: 'home'});
 document.getElementById('queueViewButton').onclick = () => goTo({type: 'queue'});
 
-async function loadQueueView() {
+async function loadQueueView(quiet) {
   const view = document.getElementById('view');
-  view.innerHTML = '<div class="empty">Loading…</div>';
+  if (!quiet) view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const q = await api('/spotify-api/queue');
     state.autoplay = q.autoplay;
@@ -2906,9 +2906,9 @@ function trackRow(t, actionBtn, opts) {
   return li;
 }
 
-async function loadRecentlyPlayed() {
+async function loadRecentlyPlayed(quiet) {
   const view = document.getElementById('view');
-  view.innerHTML = '<div class="empty">Loading…</div>';
+  if (!quiet) view.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const {items} = await api('/spotify-api/recently-played');
     // Local sqlite lookups (no Spotify cost), so fetching every row's
@@ -3376,9 +3376,26 @@ async function pollNowPlaying() {
     npState = {progressMs: np.progress_ms || 0, durationMs: np.track.duration_ms || 0, playing: np.playing, at: Date.now()};
     if (Date.now() > (state.autoplayLockUntil || 0)) state.autoplay = !!np.autoplay;
     updateMediaSession(np);
+    refreshViewOnTrackChange(np.track.uri);
   } catch (e) {}
 }
 setInterval(pollNowPlaying, 5000);
+
+// The Queue and Recently Played pages are snapshots taken when opened; when
+// the playing track changes, their Now Playing / Up Next / history are stale.
+// Re-render whichever one is showing, without the "Loading…" flash, and keep
+// the scroll position.
+let lastNpUri = null;
+async function refreshViewOnTrackChange(uri) {
+  const changed = lastNpUri !== null && uri !== lastNpUri;
+  lastNpUri = uri;
+  if (!changed) return;
+  const type = (currentDescriptor || {}).type || 'home';
+  if (type !== 'queue' && type !== 'home') return;
+  const y = window.scrollY;
+  await (type === 'queue' ? loadQueueView(true) : loadRecentlyPlayed(true));
+  if (currentDescriptor && ((currentDescriptor.type || 'home') === type)) window.scrollTo(0, y);
+}
 
 // While the user is actively dragging the thumb, the 250ms auto-render must
 // not fight the drag by snapping the value back to the last poll's position.
